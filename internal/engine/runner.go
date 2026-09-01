@@ -334,28 +334,34 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 				countryName = n
 			}
 		}
+		// the counter goes on the flag/country part — never after the
+		// channel suffix ("🇩 Germany 2 | Wpnfa", not "... | Wpnfa 2")
 		suffix := ""
 		if cfg.IncludeChannel && cfg.Channel != "" {
 			suffix = " | " + cfg.Channel
 		}
-		renamed := e.uniqueName(Flag(geo.Code) + " " + countryName + suffix)
+		renamed := e.uniqueName(Flag(geo.Code) + " " + countryName) + suffix
 		line := RenameURI(s.Raw, renamed)
 		cfg.Logf("test: OK " + geo.Code + " -> " + renamed)
 		e.noteCountry(geo.Code)
 		return line, kOK
 	}
 
-	// connected but no country — keep the original name (no warning sign),
-	// fall back to the channel name when the config had none
+	// connected but no country — keep the original name (no warning sign);
+	// when the config had no name at all, use a neutral word so the dedupe
+	// counter lands before the channel suffix, never after it
 	baseName := s.Name
 	if baseName == "" {
-		if cfg.Channel != "" {
-			baseName = cfg.Channel
-		} else {
-			baseName = s.hostport()
+		baseName = "unknown"
+		if cfg.OutLang == "fa" {
+			baseName = "ناشناس"
 		}
 	}
-	nm := e.uniqueName(baseName)
+	nmSuffix := ""
+	if cfg.IncludeChannel && cfg.Channel != "" {
+		nmSuffix = " | " + cfg.Channel
+	}
+	nm := e.uniqueName(baseName) + nmSuffix
 	line := RenameURI(s.Raw, nm)
 	cfg.Logf("test: PARTIAL (no country) -> " + nm)
 	e.mu.Lock()

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.1"
+	BotVersion = "1.0.2"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 )
@@ -26,6 +26,7 @@ type Settings struct {
 	Channel        string `json:"channel"`
 	IncludeChannel bool   `json:"include_channel"`
 	IncludeUnknown bool   `json:"include_unknown"`
+	Admins         []int64 `json:"admins"` // extra users allowed to use the bot
 
 	CaptionTemplate string            `json:"caption_template"`
 	EmojiCodes      map[string]string `json:"emoji_codes"` // ISO -> custom emoji id
@@ -56,6 +57,7 @@ const (
 	awaitCaptionTemplate
 	awaitCaptionCodes
 	awaitChannelName
+	awaitAdminAdd
 )
 
 type Bot struct {
@@ -116,20 +118,42 @@ func (b *Bot) settingsLocked() Settings {
 }
 
 // ------------------------------------------------------------------
-// fixed main menu
+// access control
 
-func mainMenu() [][]string {
-	return [][]string{
+// isAllowed: the owner or any user on the admins list.
+func (b *Bot) isAllowed(id int64) bool {
+	if id == b.ownerID {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, a := range b.settings.Admins {
+		if a == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ------------------------------------------------------------------
+// fixed main menu (the admins row is owner-only)
+
+func (b *Bot) menuFor(id int64) [][]string {
+	rows := [][]string{
 		{"📡 اسکن کانفیگ‌ها | scan", "⚙️ تنظیمات | settings"},
 		{"🏷️ کپشن و پرچم‌ها | caption", "ℹ️ درباره | about"},
 	}
+	if id == b.ownerID {
+		rows = append(rows, []string{"👥 ادمین‌ها | admins"})
+	}
+	return rows
 }
 
 func (b *Bot) sendMain(chatID int64, intro string) error {
 	if intro == "" {
-		intro = " <b>ConfigScanner Bot</b>\n\nاسکنر خروجی کانفیگ‌ها — دقیقاً همون منطق اپ: هر سرور با xray جدا تست می‌شه، کشور خروجی با رأی‌گیری ۶ سرویس جیو تشخیص داده می‌شه، و خروجی با پرچم و اسم یکتا برمی‌گرده.\n\nیک دکمه بزن 👇"
+		intro = "📡 <b>ConfigScanner Bot</b> <code>v" + BotVersion + "</code>\n\nاسکنر خروجی کانفیگ‌ها — دقیقاً همون منطق اپ: هر سرور با xray جدا تست می‌شه، کشور خروجی با رأی‌گیری ۶ سرویس جیو تشخیص داده می‌شه، و خروجی با پرچم و اسم یکتا برمی‌گرده.\n\nیک دکمه بزن 👇"
 	}
-	_, err := b.api.sendMenu(chatID, intro, mainMenu())
+	_, err := b.api.sendMenu(chatID, intro, b.menuFor(chatID))
 	return err
 }
 
@@ -276,7 +300,7 @@ func (b *Bot) startRun(c chat) {
 		}
 	}
 
-	_, _ = b.api.sendMenu(chatID, "تمام شد ✅\n\n" + summary + "\n\n🚀 اسکن بعدی؟", mainMenu())
+	_, _ = b.api.sendMenu(chatID, "تمام شد ✅\n\n" + summary + "\n\n🚀 اسکن بعدی؟", b.menuFor(chatID))
 	b.finishRunGuard()
 	_ = total
 }
@@ -499,6 +523,139 @@ func (b *Bot) cycleSetting(c chat, key string) {
 }
 
 // ------------------------------------------------------------------
+// admins (owner only)
+
+func (b *Bot) onAdminMenu(c chat) {
+	if c.ID != b.ownerID {
+		b.sendMain(c.ID, "")
+		return
+	}
+	b.mu.Lock()
+	s := b.settingsLocked()
+	b.mu.Unlock()
+	var sb strings.Builder
+	sb.WriteString("👥 <b>ادمین‌ها</b>\n\n")
+	sb.WriteString("شخص‌هایی که اجازه استفاده از ربات رو دارن. صاحب ربات همیشه دسترسی کامل داره.\n\n")
+	sb.WriteString("👑 صاحب: <code>" + itoaSafe(int(b.ownerID)) + "</code>\n")
+	if len(s.Admins) == 0 {
+		sb.WriteString("\n(ادمین اضافه‌ای ثبت نشده)\n")
+	}
+	rows := [][]string{}
+	var row []string
+	for i, a := range s.Admins {
+		row = append(row, "❌ "+itoaSafe(int(a)))
+		if len(row) == 2 || i == len(s.Admins)-1 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	rows = append(rows,
+		[]string{"➕ افزودن ادمین", "admin:add"},
+		[]string{"🗑️ بازگشت | back", "menu"})
+	_, _ = b.api.sendWithKeyboard(c.ID, sb.String(), rows, "sendMessage")
+}
+
+func (b *Bot) adminAddPrompt(c chat) {
+	if c.ID != b.ownerID {
+		b.sendMain(c.ID, "")
+		return
+	}
+	b.mu.Lock()
+	b.awaiting = awaitAdminAdd
+	b.mu.Unlock()
+	_, _ = b.api.sendWithKeyboard(c.ID,
+		"➕ <b>افزودن ادمین</b>\n\n<b>ID عددی</b> شخص رو بفرست.\n(شخص می‌تونه با /id توی همین ربات ID خودش رو بگیره)",
+		[][]string{{"✖️ لغو", "admins"}}, "sendMessage")
+}
+
+func (b *Bot) onAdminAdd(c chat, text string) {
+	if c.ID != b.ownerID {
+		b.sendMain(c.ID, "")
+		return
+	}
+	idStr := strings.TrimSpace(strings.TrimPrefix(text, "@"))
+	id, ok := parseID(idStr)
+	if !ok || id <= 0 {
+		_, _ = b.api.sendWithKeyboard(c.ID,
+			"🤔 این یه ID عددی معتبر نیست. عددی که /id می‌ده رو بفرست (مثلاً <code>123456789</code>).",
+			[][]string{{"👥 ادمین‌ها", "admins"}}, "sendMessage")
+		return
+	}
+	b.mu.Lock()
+	if id == b.ownerID {
+		b.mu.Unlock()
+		_, _ = b.api.sendWithKeyboard(c.ID, "شما خودت صاحب رباتی و همیشه دسترسی داری 🙂",
+			[][]string{{"👥 ادمین‌ها", "admins"}}, "sendMessage")
+		return
+	}
+	dup := false
+	for _, a := range b.settings.Admins {
+		if a == id {
+			dup = true
+		}
+	}
+	if !dup {
+		b.settings.Admins = append(b.settings.Admins, id)
+	}
+	b.save()
+	b.mu.Unlock()
+	if dup {
+		_, _ = b.api.sendWithKeyboard(c.ID, "این ID قبلاً ثبت شده بود.",
+			[][]string{{"👥 ادمین‌ها", "admins"}}, "sendMessage")
+		return
+	}
+	_, _ = b.api.sendWithKeyboard(c.ID,
+		"✅ <code>"+itoaSafe(int(id))+"</code> به‌عنوان ادمین اضافه شد. از این به بعد می‌تونه از همه امکانات ربات استفاده کنه.",
+		[][]string{{"👥 ادمین‌ها", "admins"}}, "sendMessage")
+}
+
+func (b *Bot) onAdminRemove(c chat, idStr string) {
+	if c.ID != b.ownerID {
+		b.sendMain(c.ID, "")
+		return
+	}
+	id, ok := parseID(idStr)
+	if !ok {
+		return
+	}
+	b.mu.Lock()
+	out := b.settings.Admins[:0]
+	removed := false
+	for _, a := range b.settings.Admins {
+		if a == id {
+			removed = true
+			continue
+		}
+		out = append(out, a)
+	}
+	b.settings.Admins = out
+	b.save()
+	b.mu.Unlock()
+	if !removed {
+		_, _ = b.api.sendWithKeyboard(c.ID, "این ID توی لیست نبود.",
+			[][]string{{"👥 ادمین‌ها", "admins"}}, "sendMessage")
+		return
+	}
+	_, _ = b.api.sendWithKeyboard(c.ID,
+		"🗑️ <code>"+itoaSafe(int(id))+"</code> از ادمین‌ها حذف شد و دسترسی‌اش قطع شد.",
+		[][]string{{"👥 ادمین‌ها", "admins"}}, "sendMessage")
+}
+
+func parseID(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n := int64(0)
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	return n, true
+}
+
+// ------------------------------------------------------------------
 // about
 
 func (b *Bot) onAbout(c chat) {
@@ -531,7 +688,7 @@ func (b *Bot) handleUpdate(u update) {
 	if c.ID == 0 {
 		return
 	}
-	if c.ID != b.ownerID {
+	if !b.isAllowed(c.ID) {
 		if u.Message != nil {
 			_, _ = b.api.sendMessage(c.ID, "⛔ این ربات خصوصی‌ه.")
 		}
@@ -540,7 +697,7 @@ func (b *Bot) handleUpdate(u update) {
 
 	if u.CallbackQuery != nil {
 		cq := u.CallbackQuery
-		if cq.From != nil && cq.From.ID != b.ownerID {
+		if cq.From != nil && !b.isAllowed(cq.From.ID) {
 			return
 		}
 		b.mu.Lock()
@@ -583,6 +740,12 @@ func (b *Bot) handleUpdate(u update) {
 			b.cycleSetting(c, strings.TrimPrefix(data, "set:"))
 		case data == "about":
 			b.onAbout(c)
+		case data == "admins":
+			b.onAdminMenu(c)
+		case data == "admin:add":
+			b.adminAddPrompt(c)
+		case strings.HasPrefix(data, "admin:rm:"):
+			b.onAdminRemove(c, strings.TrimPrefix(data, "admin:rm:"))
 		case data == "noop":
 		}
 		return
@@ -673,6 +836,12 @@ func (b *Bot) handleUpdate(u update) {
 				"✅ سافیکس کانال: <b> | "+escapeHTML(name)+"</b>",
 				[][]string{{"⚙️ تنظیمات", "settings"}}, "sendMessage")
 		}
+		return
+	case awaitAdminAdd:
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.mu.Unlock()
+		b.onAdminAdd(c, text)
 		return
 	}
 

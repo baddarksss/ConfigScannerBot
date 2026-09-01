@@ -23,11 +23,14 @@ func newAPI(token string) *tgAPI {
 type update struct {
 	UpdateID int `json:"update_id"`
 	Message  *struct {
-		MessageID    int    `json:"message_id"`
-		ChatID       int64  `json:"chat_id"`
-		Text         string `json:"text"`
-		Caption      string `json:"caption"`
-		Document     *struct {
+		MessageID int    `json:"message_id"`
+		Text      string `json:"text"`
+		Caption   string `json:"caption"`
+		// Telegram nests the chat inside the message: "chat": {"id": ...}
+		Chat *struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
+		Document *struct {
 			FileID   string `json:"file_id"`
 			FileSize int    `json:"file_size"`
 			FileName string `json:"file_name"`
@@ -38,11 +41,15 @@ type update struct {
 		} `json:"from"`
 	} `json:"message"`
 	CallbackQuery *struct {
-		ID       string `json:"id"`
-		ChatID   int64  `json:"chat_id"`
-		MessageID int   `json:"message_id"`
-		Data     string `json:"data"`
-		From     *struct {
+		ID   string `json:"id"`
+		Data string `json:"data"`
+		// a callback carries its chat inside "message.chat" (not a flat field)
+		Message *struct {
+			Chat *struct {
+				ID int64 `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+		From *struct {
 			ID int64 `json:"id"`
 		} `json:"from"`
 	} `json:"callback_query"`
@@ -54,15 +61,16 @@ type chat struct {
 }
 
 func (u *update) chat() chat {
-	if u.Message != nil {
+	if u.Message != nil && u.Message.Chat != nil {
 		name := ""
 		if u.Message.From != nil {
 			name = u.Message.From.Name
 		}
-		return chat{ID: u.Message.ChatID, Name: name}
+		return chat{ID: u.Message.Chat.ID, Name: name}
 	}
-	if u.CallbackQuery != nil {
-		return chat{ID: u.CallbackQuery.ChatID}
+	if u.CallbackQuery != nil && u.CallbackQuery.Message != nil &&
+		u.CallbackQuery.Message.Chat != nil {
+		return chat{ID: u.CallbackQuery.Message.Chat.ID}
 	}
 	return chat{}
 }

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.4"
+	BotVersion = "1.0.5"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 )
@@ -139,12 +139,13 @@ func (b *Bot) isAllowed(id int64) bool {
 // fixed main menu (the admins row is owner-only)
 
 func (b *Bot) menuFor(id int64) [][]string {
+	// flat rows: [text1, cb1, text2, cb2]
 	rows := [][]string{
-		{"📡 اسکن کانفیگ‌ها | scan", "⚙️ تنظیمات | settings"},
-		{"🏷️ کپشن و پرچم‌ها | caption", "ℹ️ درباره | about"},
+		{"📡 اسکن کانفیگ‌ها | scan", "scan", "⚙️ تنظیمات | settings", "settings"},
+		{"🏷️ کپشن و پرچم‌ها | caption", "caption", "ℹ️ درباره | about", "about"},
 	}
 	if id == b.ownerID {
-		rows = append(rows, []string{"👥 ادمین‌ها | admins"})
+		rows = append(rows, []string{"👥 ادمین‌ها | admins", "admins"})
 	}
 	return rows
 }
@@ -542,12 +543,15 @@ func (b *Bot) onAdminMenu(c chat) {
 	}
 	rows := [][]string{}
 	var row []string
-	for i, a := range s.Admins {
-		row = append(row, "❌ "+itoaSafe(int(a)))
-		if len(row) == 2 || i == len(s.Admins)-1 {
+	for _, a := range s.Admins {
+		row = append(row, "❌ "+itoaSafe(int(a)), "admin:rm:"+itoaSafe(int(a)))
+		if len(row) == 4 { // two buttons per row
 			rows = append(rows, row)
 			row = nil
 		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
 	}
 	rows = append(rows,
 		[]string{"➕ افزودن ادمین", "admin:add"},

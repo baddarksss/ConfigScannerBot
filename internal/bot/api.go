@@ -84,6 +84,7 @@ func (a *tgAPI) call(method string, payload map[string]any, out any) error {
 		"https://api.telegram.org/bot"+a.token+"/"+method,
 		"application/json", bytes.NewReader(b))
 	if err != nil {
+		fmt.Printf("TG API %s: %v\n", method, err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -97,6 +98,7 @@ func (a *tgAPI) call(method string, payload map[string]any, out any) error {
 		return fmt.Errorf("tg %s: bad response: %s", method, body[:min(len(body), 300)])
 	}
 	if !res.OK {
+		fmt.Printf("TG API %s error: %s\n", method, res.Err)
 		return fmt.Errorf("tg %s: %s", method, res.Err)
 	}
 	if out != nil && len(res.Result) > 0 {
@@ -124,17 +126,40 @@ func (a *tgAPI) sendMenu(chatID int64, text string, rows [][]string) (int, error
 	return a.sendWithKeyboard(chatID, text, rows, "sendMessage")
 }
 
-func (a *tgAPI) sendWithKeyboard(chatID int64, text string, rows [][]string, method string) (int, error) {
-	kb := map[string]any{
-		"inline_keyboard": rows,
-	}
-	payload := map[string]any{
+func menuPayload(chatID int64, text string, rows [][]string) map[string]any {
+	return map[string]any{
 		"chat_id":    chatID,
 		"text":       text,
 		"parse_mode": "HTML",
 		"disable_web_page_preview": true,
-		"reply_markup": kb,
+		"reply_markup": map[string]any{
+			"inline_keyboard": buildKeyboard(rows),
+		},
 	}
+}
+
+// Rows are passed flat as [text, callbackData, text, callbackData, ...]
+// per row. Telegram needs each button as an object:
+// {"text": "...", "callback_data": "..."}.
+func buildKeyboard(rows [][]string) [][]map[string]any {
+	keyboard := make([][]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		btns := make([]map[string]any, 0, (len(row)+1)/2)
+		for i := 0; i+1 < len(row); i += 2 {
+			btns = append(btns, map[string]any{
+				"text":          row[i],
+				"callback_data": row[i+1],
+			})
+		}
+		if len(btns) > 0 {
+			keyboard = append(keyboard, btns)
+		}
+	}
+	return keyboard
+}
+
+func (a *tgAPI) sendWithKeyboard(chatID int64, text string, rows [][]string, method string) (int, error) {
+	payload := menuPayload(chatID, text, rows)
 	var m tgMessage
 	if err := a.call(method, payload, &m); err != nil {
 		return 0, err
@@ -159,7 +184,7 @@ func (a *tgAPI) editKeyboard(messageID int, chatID int64, text string, rows [][]
 		"text":         text,
 		"parse_mode":   "HTML",
 		"disable_web_page_preview": true,
-		"reply_markup": map[string]any{"inline_keyboard": rows},
+		"reply_markup": map[string]any{"inline_keyboard": buildKeyboard(rows)},
 	}, nil)
 }
 

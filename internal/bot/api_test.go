@@ -64,3 +64,29 @@ func TestUpdateParseCallback(t *testing.T) {
 		t.Fatalf("from id = %d", u.CallbackQuery.From.ID)
 	}
 }
+
+// The keyboard payload must be arrays of button objects, not flat strings —
+// Telegram rejects anything else with a 400 and the message never arrives.
+func TestBuildKeyboardShape(t *testing.T) {
+	rows := [][]string{
+		{"📡 scan", "scan", "⚙️ settings", "settings"},
+		{"🗑️ back", "menu"},
+	}
+	kb := buildKeyboard(rows)
+	if len(kb) != 2 {
+		t.Fatalf("rows = %d, want 2", len(kb))
+	}
+	if len(kb[0]) != 2 || kb[0][0]["text"] != "📡 scan" || kb[0][0]["callback_data"] != "scan" {
+		t.Fatalf("row0 = %#v", kb[0])
+	}
+	if kb[0][1]["text"] != "⚙️ settings" || kb[0][1]["callback_data"] != "settings" {
+		t.Fatalf("row0 btn1 = %#v", kb[0][1])
+	}
+	if len(kb[1]) != 1 || kb[1][0]["callback_data"] != "menu" {
+		t.Fatalf("row1 = %#v", kb[1])
+	}
+	b, _ := json.Marshal(kb)
+	if !json.Valid(b) {
+		t.Fatal("keyboard not valid json")
+	}
+}

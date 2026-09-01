@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.2"
+	BotVersion = "1.0.3"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 )
@@ -859,20 +859,45 @@ func (b *Bot) Loop() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bot started as @%s, owner=%d\n", name, b.ownerID)
+	fmt.Printf("bot started as @%s, owner=%d (v%s)\n", name, b.ownerID, BotVersion)
 	offset := 0
 	for {
 		ups, err := b.api.getUpdates(offset+1, 50)
 		if err != nil {
+			// Telegram only retains ~24h of updates. After a restart the
+			// offset starts at 0; when the bot's last updates are older
+			// than that window the API answers "You reached the start of
+			// the range" and polling would loop forever on the same stale
+			// offset. Jump to the tail: an offset beyond the latest update
+			// returns an empty list, and polling resumes from the present.
+			if strings.Contains(err.Error(), "start of the range") {
+				fmt.Println("getUpdates: start of the range - resetting offset to tail")
+				offset = 1 << 60
+				continue
+			}
 			fmt.Println("getUpdates error:", err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
 		for _, u := range ups {
 			offset = u.UpdateID
+			if u.Message != nil {
+				fmt.Printf("update %d: chat=%d msg=%q\n",
+					u.UpdateID, u.Message.ChatID, clip(u.Message.Text, 60))
+			} else if u.CallbackQuery != nil {
+				fmt.Printf("update %d: callback=%q\n",
+					u.UpdateID, clip(u.CallbackQuery.Data, 60))
+			}
 			go b.handleUpdate(u)
 		}
 	}
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func (b *Bot) getMeName() (string, error) {

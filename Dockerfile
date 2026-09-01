@@ -21,9 +21,9 @@ RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERS
 
 COPY --from=build /out/cfgscan-bot /usr/local/bin/cfgscan-bot
 
-# persistent settings (attach a Railway volume at /data)
+# persistent settings: attach a Railway VOLUME at /data from the dashboard
+# (the Dockerfile VOLUME instruction is rejected by Railway builds)
 ENV DATA_DIR=/data
 ENV XRAY_BIN=/usr/local/bin/xray
-VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/local/bin/cfgscan-bot"]

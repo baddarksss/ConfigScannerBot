@@ -178,14 +178,19 @@ func (a *tgAPI) editText(messageID int, chatID int64, text string) error {
 }
 
 func (a *tgAPI) editKeyboard(messageID int, chatID int64, text string, rows [][]string) error {
-	return a.call("editMessageText", map[string]any{
+	payload := map[string]any{
 		"chat_id":      chatID,
 		"message_id":   messageID,
 		"text":         text,
 		"parse_mode":   "HTML",
 		"disable_web_page_preview": true,
-		"reply_markup": map[string]any{"inline_keyboard": buildKeyboard(rows)},
-	}, nil)
+	}
+	if kb := buildKeyboard(rows); len(kb) > 0 {
+		payload["reply_markup"] = map[string]any{"inline_keyboard": kb}
+	} else {
+		payload["reply_markup"] = nil // clears the keyboard
+	}
+	return a.call("editMessageText", payload, nil)
 }
 
 func (a *tgAPI) answerCallback(cbID string, text string) {

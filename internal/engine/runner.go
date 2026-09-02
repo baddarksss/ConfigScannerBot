@@ -2,12 +2,16 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -293,6 +297,21 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 		}
 	}
 
+	// insecure=1 with plain TLS: fetch the server's leaf cert and pin it
+	// (allowInsecure no longer exists in modern Xray) — app parity
+	if s.Protocol != "hysteria2" && s.Security == "tls" && s.AllowInsecure {
+		sni := s.SNI
+		if sni == "" {
+			sni = s.Host
+		}
+		if h := PinCert(s.Host, s.Port, sni, 8000); h != "" {
+			s.PinnedCert = h
+			cfg.Logf("test: certpin " + s.hostport() + " sni=" + sni + " hash=" + h)
+		} else {
+			cfg.Logf("test: certpin FAILED " + s.hostport() + " sni=" + sni)
+		}
+	}
+
 	// Engine choice: Xray-core's salamander/gecko UDP obfs is broken upstream
 	// (its finalmask wrapper never sends or reads packets — verified by the
 	// app's packet capture; XTLS/Xray-core#5712 closed as not-planned), so
@@ -538,6 +557,33 @@ func startHysteria(s *ServerSpec, cfg Config, port int) (*exec.Cmd, string, stri
 
 func yamlQuote(v string) string {
 	return "\"" + strings.ReplaceAll(strings.ReplaceAll(v, `\`, `\\`), `"`, `\"`) + "\""
+}
+
+// PinCert mirrors the app's CertPinner: a plain TLS handshake (trust-all for
+// this handshake only) to fetch the server's leaf certificate and return its
+// SHA-256 hash (lowercase hex) for xray's "pinnedPeerCertSha256" field.
+// The actual proxy connection in Xray still verifies the pinned hash strictly.
+func PinCert(host string, port int, sni string, timeoutMs int) string {
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	if sni != "" {
+		cfg.ServerName = sni
+	}
+	d := tls.Dialer{Config: cfg, NetDialer: &net.Dialer{Timeout: time.Duration(timeoutMs) * time.Millisecond}}
+	conn, err := d.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return ""
+	}
+	cs := tc.ConnectionState()
+	if len(cs.PeerCertificates) == 0 {
+		return ""
+	}
+	h := sha256.Sum256(cs.PeerCertificates[0].Raw)
+	return hex.EncodeToString(h[:])
 }
 
 func Flag(code string) string {

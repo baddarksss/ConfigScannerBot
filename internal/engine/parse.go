@@ -35,6 +35,7 @@ type ServerSpec struct {
 	HostHeader string
 	ServiceName string
 	AllowInsecure bool
+	PinnedCert   string // SHA-256 of the leaf cert (set at runtime for insecure=1)
 
 	// trojan / ss / hy2
 	Password string

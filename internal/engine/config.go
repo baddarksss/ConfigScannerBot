@@ -219,12 +219,16 @@ func buildStreamSettings(s *ServerSpec) (map[string]any, error) {
 					t["alpn"] = a
 				}
 			}
-			// ECH: panels send a resolver hint (ip.gs+udp://…); xray 26.x
-			// "half" = resolve the ECH config itself when advertised
-			if s.ECH != "" {
-				t["echForceQuery"] = "half"
-			}
-			st["tlsSettings"] = t
+		// ECH: panels send a resolver hint (ip.gs+udp://…); xray 26.x
+		// "half" = resolve the ECH config itself when advertised
+		if s.ECH != "" {
+			t["echForceQuery"] = "half"
+		}
+		// self-signed / insecure=1: pin the leaf cert fetched at test start
+		if s.PinnedCert != "" {
+			t["pinnedPeerCertSha256"] = s.PinnedCert
+		}
+		st["tlsSettings"] = t
 		}
 	}
 	if s.Network == "ws" {

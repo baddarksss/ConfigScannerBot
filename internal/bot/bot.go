@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.9"
+	BotVersion = "1.0.10"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -34,6 +34,7 @@ type Settings struct {
 
 	CaptionTemplate string            `json:"caption_template"`
 	EmojiCodes      map[string]string `json:"emoji_codes"` // ISO -> custom emoji id
+	MessageForUsers string            `json:"message_for_users"`
 }
 
 func (s *Settings) defaults() {
@@ -63,6 +64,7 @@ const (
 	awaitAdminAdd
 	awaitCodesImport
 	awaitCodeSet
+	awaitMessageForUsers
 )
 
 type Bot struct {
@@ -72,17 +74,17 @@ type Bot struct {
 	xrayBin string
 	hyBin   string
 
-	mu        sync.Mutex
-	settings  Settings
-	running   bool
-	pending   []string // raw config lines awaiting confirmation
-	runMessage int      // progress message id (the nav message itself)
-	runChat   int64
-	awaiting  awaiting
-	awaitISO  string // target country for awaitCodeSet
-	navMsg    map[int64]int // per-chat id of the current interactive message
+	mu         sync.Mutex
+	settings   Settings
+	running    bool
+	pending    []string // raw config lines awaiting confirmation
+	runMessage int      // progress message id
+	runChat    int64
+	awaiting   awaiting
+	awaitISO   string // target country for awaitCodeSet
 
 	lastCodes []string
+	lastFlags []string
 	lastLog   []string
 }
 
@@ -99,7 +101,6 @@ func NewBot(token string, ownerID int64, dataDir, xrayBin, hyBin string) *Bot {
 		dataDir: dataDir,
 		xrayBin: xrayBin,
 		hyBin:   hyBin,
-		navMsg:  map[int64]int{},
 	}
 	b.load()
 	return b
@@ -126,8 +127,6 @@ func (b *Bot) save() {
 	_ = os.WriteFile(filepath.Join(b.dataDir, "settings.json"), bb, 0o644)
 }
 
-// settingsLocked returns a SNAPSHOT copy — mutation-safe for readers.
-// Writers must lock and modify b.settings directly.
 func (b *Bot) settingsLocked() Settings {
 	b.settings.defaults()
 	return b.settings
@@ -136,7 +135,6 @@ func (b *Bot) settingsLocked() Settings {
 // ------------------------------------------------------------------
 // access control
 
-// isAllowed: the owner or any user on the admins list.
 func (b *Bot) isAllowed(id int64) bool {
 	if id == b.ownerID {
 		return true
@@ -152,69 +150,95 @@ func (b *Bot) isAllowed(id int64) bool {
 }
 
 // ------------------------------------------------------------------
-// navigation
-//
-// nav renders text+buttons by EDITING this chat's current interactive
-// message in place (one stable message, like the app's screens); a new
-// message is sent only when there is none to edit (or the edit fails).
+// Reply Keyboards (Fixed Persistent Bottom Buttons)
 
-func (b *Bot) nav(c chat, text string, rows [][]string) {
-	b.mu.Lock()
-	msgID := b.navMsg[c.ID]
-	b.mu.Unlock()
-	if msgID > 0 {
-		if err := b.api.editKeyboard(msgID, c.ID, text, rows); err == nil {
-			return
-		}
+func (b *Bot) replyMainMenuFor(id int64, pendingCount int) [][]string {
+	var rows [][]string
+	if pendingCount > 0 {
+		rows = append(rows, []string{
+			fmt.Sprintf("▶️ شروع اسکن (%d کانفیگ)", pendingCount),
+			"🗑️ پاک کردن لیست",
+		})
 	}
-	id, err := b.api.sendWithKeyboard(c.ID, text, rows, "sendMessage")
-	if err == nil {
-		b.mu.Lock()
-		b.navMsg[c.ID] = id
-		b.mu.Unlock()
-	}
-}
-
-// navID returns the current interactive message id for this chat (0 if none).
-func (b *Bot) navID(chatID int64) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.navMsg[chatID]
-}
-
-// ------------------------------------------------------------------
-// fixed main menu (the admins row is owner-only)
-
-func (b *Bot) replyMenuFor(id int64) [][]string {
-	rows := [][]string{
-		{"📡 اسکن کانفیگ", "⚙️ تنظیمات"},
-		{"🏷️ کپشن و پرچم", "ℹ️ درباره"},
-	}
+	rows = append(rows, []string{"📡 اسکن کانفیگ", "⚙️ تنظیمات"})
+	rows = append(rows, []string{"🏷️ کپشن و پرچم", "✏️ پیام برای کاربران"})
+	rows = append(rows, []string{"📊 گزارش / لاگ", "ℹ️ راهنما و درباره"})
 	if id == b.ownerID {
 		rows = append(rows, []string{"👥 ادمین‌ها"})
 	}
 	return rows
 }
 
-func (b *Bot) menuFor(id int64) [][]string {
-	// flat rows: [text1, cb1, text2, cb2]
-	rows := [][]string{
-		{"📡 اسکن کانفیگ", "scan", "⚙️ تنظیمات", "settings"},
-		{"🏷️ کپشن و پرچم", "caption", "ℹ️ درباره", "about"},
+func (b *Bot) replySettingsMenu() [][]string {
+	b.mu.Lock()
+	s := b.settingsLocked()
+	b.mu.Unlock()
+
+	langName := "فارسی"
+	if s.OutLang == "en" {
+		langName = "English"
 	}
-	if id == b.ownerID {
-		rows = append(rows, []string{"👥 ادمین‌ها", "admins"})
+	chState := "خاموش"
+	if s.IncludeChannel {
+		if s.Channel != "" {
+			chState = "روشن (" + s.Channel + ")"
+		} else {
+			chState = "روشن (بدون نام)"
+		}
 	}
-	return rows
+	unkState := "خاموش"
+	if s.IncludeUnknown {
+		unkState = "روشن"
+	}
+
+	return [][]string{
+		{fmt.Sprintf("🔢 همزمانی: %d", s.Parallel), fmt.Sprintf("⏱️ تایم‌اوت: %d ثانیه", s.TimeoutSec)},
+		{fmt.Sprintf("🌐 زبان: %s", langName), fmt.Sprintf("📢 سافیکس: %s", chState)},
+		{fmt.Sprintf("🔗 خروجی بدون کشور: %s", unkState), "📢 تنظیم نام کانال"},
+		{"↩️ بازگشت به منوی اصلی"},
+	}
+}
+
+func (b *Bot) replyCaptionMenu() [][]string {
+	return [][]string{
+		{"✏️ ویرایش قالب کپشن", "🎨 کدهای ایموجی کشورها"},
+		{"👁️ پیش‌نمایش کپشن", "↩️ بازگردانی قالب پیش‌فرض"},
+		{"📥 وارد کردن دسته‌ای کدها", "📤 خروجی گرفتن کدها"},
+		{"↩️ بازگشت به منوی اصلی"},
+	}
+}
+
+func (b *Bot) replyMsgForUsersMenu() [][]string {
+	return [][]string{
+		{"✏️ تنظیم / ویرایش متن", "👁️ مشاهده متن فعلی"},
+		{"🗑️ حذف متن پیام", "↩️ بازگشت به منوی اصلی"},
+	}
+}
+
+func (b *Bot) replyAdminMenu() [][]string {
+	return [][]string{
+		{"➕ افزودن ادمین", "📋 لیست ادمین‌ها"},
+		{"↩️ بازگشت به منوی اصلی"},
+	}
 }
 
 func (b *Bot) mainIntro() string {
+	b.mu.Lock()
+	p := len(b.pending)
+	b.mu.Unlock()
+
+	status := ""
+	if p > 0 {
+		status = fmt.Sprintf("\n📥 <b>%d کانفیگ در صف آماده اسکن است.</b> دکمه‌ی «▶️ شروع اسکن» را بزنید.\n", p)
+	}
+
 	return "📡 <b>ConfigScanner Bot</b> <code>v" + BotVersion + "</code>\n\n" +
-		"اسکنر خروجی کانفیگ‌ها — دقیقاً همون منطق اپ:\n" +
-		"• هر سرور با xray جدا و تخصیص اتمیک پورت تست می‌شه\n" +
-		"• کشور خروجی با استعلام موازی ۶ سرویس جیو\n" +
-		"• خروجی با پرچم و اسم یکتا + کپشن custom emoji\n\n" +
-		"از منوی زیر یا دکمه‌ها انتخاب کنید 👇"
+		"اسکنر خروجی کانفیگ‌ها با هسته رسمی Xray و Hysteria:\n" +
+		"• تست کامل اتصال و تخصیص اتمیک پورت\n" +
+		"• استعلام موازی ۶ سرویس جیو و نام‌گذاری دقیق کشورها\n" +
+		"• ارسال لینک‌های سالم، پرچم‌های استاندارد، کپشن و پیام کاربران\n" +
+		status + "\n" +
+		"کانفیگ‌ها را پیست کنید یا از منوی پایین انتخاب فرمایید 👇"
 }
 
 func (b *Bot) sendMain(c chat, intro string) {
@@ -224,8 +248,9 @@ func (b *Bot) sendMain(c chat, intro string) {
 	b.mu.Lock()
 	b.awaiting = awaitNone
 	b.awaitISO = ""
+	p := len(b.pending)
 	b.mu.Unlock()
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, intro, b.replyMenuFor(c.ID))
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, intro, b.replyMainMenuFor(c.ID, p))
 }
 
 // ------------------------------------------------------------------
@@ -233,85 +258,80 @@ func (b *Bot) sendMain(c chat, intro string) {
 
 func (b *Bot) onScanRequest(c chat) {
 	b.mu.Lock()
-	b.pending = nil
+	p := len(b.pending)
 	b.mu.Unlock()
-	b.nav(c,
-		"📡 <b>اسکن کانفیگ</b>\n\n"+
-			"کانفیگ‌ها رو <b>پیست</b> کن یا <b>فایل .txt</b> بفرست — هر خط یک کانفیگ:\n"+
-			"<code>vless · vmess · trojan · ss · hy2 · ssr · tuic</code>\n\n"+
-			"💡 چند لیست هم می‌تونی پشت‌سرهم بفرستی؛ همه جمع می‌شن و با یک دکمه شروع می‌کنی.",
-		[][]string{{"↩️ بازگشت", "menu"}})
+
+	msg := "📡 <b>اسکن کانفیگ</b>\n\n" +
+		"کانفیگ‌ها را <b>پیست</b> کنید یا <b>فایل .txt</b> بفرستید — هر خط یک کانفیگ:\n" +
+		"<code>vless · vmess · trojan · ss · hy2 · ssr · tuic</code>\n\n" +
+		"💡 می‌توانید چند لیست را پشت‌سرهم بفرستید؛ همه با هم جمع می‌شوند."
+	if p > 0 {
+		msg += fmt.Sprintf("\n\n📥 <b>هم‌اکنون %d کانفیگ در صف آماده است.</b>", p)
+	}
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMainMenuFor(c.ID, p))
 }
 
-// onConfigInput collects config lines. Successive messages are APPENDED to
-// the pending list (the user may paste several lists before pressing start).
 func (b *Bot) onConfigInput(c chat, raw string) {
 	lines := splitConfigLines(raw)
 	b.mu.Lock()
 	running := b.running
 	b.mu.Unlock()
 	if running {
-		_, _ = b.api.sendMessage(c.ID, "⏳ هنوز یک اسکن در حال اجراست — صبر کن تمام شود.")
+		_, _ = b.api.sendMessage(c.ID, "⏳ یک اسکن در حال اجراست — لطفاً تا پایان صبر کنید.")
 		return
 	}
 	if len(lines) == 0 {
-		b.nav(c,
-			"🤔 کانفیگی توی پیام پیدا نشد.\nهر خط باید با یکی از این‌ها شروع بشه:\n<code>vless:// · vmess:// · trojan:// · ss:// · hysteria2://</code>\n\nدوباره بفرست یا:",
-			[][]string{{"↩️ بازگشت", "menu"}})
+		_, _ = b.api.sendWithReplyKeyboard(c.ID,
+			"🤔 کانفیگی در متن پیدا نشد.\nهر خط باید با یکی از این پروتکل‌ها شروع شود:\n<code>vless:// · vmess:// · trojan:// · ss:// · hysteria2://</code>",
+			b.replyMainMenuFor(c.ID, 0))
 		return
 	}
 
 	b.mu.Lock()
-	extra := len(b.pending) > 0
 	b.pending = append(b.pending, lines...)
 	total := len(b.pending)
 	s := b.settingsLocked()
 	b.mu.Unlock()
 
-	confirm := fmt.Sprintf("✅ <b>%d کانفیگ</b> آماده‌ست", total)
-	if extra {
-		confirm += "\n\n📥 لیست جدید هم جمع شد"
-	}
-	confirm += fmt.Sprintf("\n\n⏱️ زمان تقریبی: %s\n\nبرای شروع اسکن دکمه‌ی زیر رو بزن:",
-		estimateDuration(total, s.Parallel))
-	rows := [][]string{
-		{"🚀 شروع اسکن", "scan:start", "🗑️ لغو و پاک‌سازی", "scan:cancel"},
-	}
-	b.nav(c, confirm, rows)
+	confirm := fmt.Sprintf("✅ <b>%d کانفیگ آماده اسکن</b>\n\n"+
+		"⏱️ زمان تقریبی: %s\n\n"+
+		"👇 برای شروع اسکن، دکمه‌ی ثابت <b>«▶️ شروع اسکن»</b> را در پایین صفحه لمس کنید:",
+		total, estimateDuration(total, s.Parallel))
+
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, confirm, b.replyMainMenuFor(c.ID, total))
 }
 
 func (b *Bot) cancelPending(c chat) {
 	b.mu.Lock()
 	b.pending = nil
 	b.mu.Unlock()
-	b.nav(c, "✖️ لیست کانفیگ‌ها پاک شد.",
-		[][]string{{"📡 اسکن کانفیگ", "scan"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, "🗑️ لیست کانفیگ‌ها پاک شد.", b.replyMainMenuFor(c.ID, 0))
 }
 
 func (b *Bot) startRun(c chat) {
 	b.mu.Lock()
 	if b.running {
 		b.mu.Unlock()
-		_, _ = b.api.sendMessage(c.ID, "⏳ هنوز یک اسکن در حال اجراست — صبر کن تمام شود.")
+		_, _ = b.api.sendMessage(c.ID, "⏳ اسکن در حال اجراست — لطفاً صبر کنید.")
 		return
 	}
 	if len(b.pending) == 0 {
 		b.mu.Unlock()
-		_, _ = b.api.sendMessage(c.ID, "اول کانفیگ‌ها رو بفرست.")
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 ابتدا کانفیگ‌ها را بفرستید یا پیست کنید.", b.replyMainMenuFor(c.ID, 0))
 		return
 	}
 	raw := strings.Join(b.pending, "\n")
 	b.pending = nil
 	b.running = true
 	b.runChat = c.ID
-	b.lastLog = nil // each run starts with a clean log
+	b.lastLog = nil
 	cfg := b.settingsLocked()
 	b.mu.Unlock()
 
 	servers := engine.ParseInput(raw)
 	if len(servers) == 0 {
 		b.finishRunGuard()
-		b.nav(c, "🤔 هیچ خط قابل شناسایی نبود.", [][]string{{"↩️ بازگشت", "menu"}})
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 هیچ خط قابل شناسایی نبود.", b.replyMainMenuFor(c.ID, 0))
 		return
 	}
 
@@ -319,9 +339,13 @@ func (b *Bot) startRun(c chat) {
 		"📦 %d سرور · ⚙️ %d همزمان · ⏱️ تایم‌اوت %d ثانیه\n\n"+
 		"%s\n\n⏳ در حال اجرا…",
 		len(servers), cfg.Parallel, cfg.TimeoutSec, progressBar(0, len(servers)))
-	b.nav(c, intro, nil)
+
+	progMsgID, err := b.api.sendMessage(c.ID, intro)
+	if err != nil {
+		b.runLog("error sending start message: " + err.Error())
+	}
 	b.mu.Lock()
-	b.runMessage = b.navMsg[c.ID]
+	b.runMessage = progMsgID
 	b.mu.Unlock()
 
 	eng := engine.NewEngine(engine.Config{
@@ -337,12 +361,17 @@ func (b *Bot) startRun(c chat) {
 		Logf:           b.runLog,
 	})
 
-	var lastEdit time.Time
-	var lastLine string
+	var (
+		lastEdit time.Time
+		lastLine string
+		editMu   sync.Mutex
+	)
 
 	res := eng.Run(servers, func(d, tot int, hostport, mark string) {
+		editMu.Lock()
+		defer editMu.Unlock()
 		lastLine = mark + " " + hostport
-		if time.Since(lastEdit) < 2*time.Second {
+		if time.Since(lastEdit) < 1500*time.Millisecond && d < tot {
 			return
 		}
 		lastEdit = time.Now()
@@ -353,25 +382,32 @@ func (b *Bot) startRun(c chat) {
 		if msgID <= 0 {
 			return
 		}
-		_ = b.api.editKeyboard(msgID, chatID, fmt.Sprintf(
+		pct := 0
+		if tot > 0 {
+			pct = d * 100 / tot
+		}
+		text := fmt.Sprintf(
 			"🔍 <b>در حال اسکن…</b> %d%%\n\n%s\n\n📦 %d از %d\n%s\n\n⚙️ %d همزمان · ⏱️ %d ثانیه",
-			d*100/tot, progressBar(d, tot), d, tot, lastLine, cfg.Parallel, cfg.TimeoutSec), nil)
+			pct, progressBar(d, tot), d, tot, escapeHTML(lastLine), cfg.Parallel, cfg.TimeoutSec)
+		_ = b.api.editText(msgID, chatID, text)
 	})
 
 	b.mu.Lock()
 	b.lastCodes = res.CountryCodes
+	b.lastFlags = res.Flags
 	msgID := b.runMessage
 	chatID := b.runChat
 	b.mu.Unlock()
+
 	if msgID > 0 {
-		_ = b.api.editKeyboard(msgID, chatID, fmt.Sprintf(
-			"✅ <b>اسکن تمام شد</b>\n\n%s", res.Summary(cfg.OutLang)), nil)
+		_ = b.api.editText(msgID, chatID, fmt.Sprintf(
+			"✅ <b>اسکن تمام شد</b>\n\n%s", res.Summary(cfg.OutLang)))
 	}
 
-	// 1) working links only (clean output, ready to copy)
+	// 1) Working links only (clean output)
 	if len(res.Links) > 0 {
 		linksBody := strings.Join(res.Links, "\n")
-		cap := fmt.Sprintf("🔗 <b>%d لینک سالم</b> — فقط لینک‌ها، آماده کپی", len(res.Links))
+		cap := fmt.Sprintf("🔗 <b>%d لینک سالم</b> — آماده کپی:", len(res.Links))
 		if cfg.IncludeUnknown && res.NoCountry > 0 {
 			cap += " (شامل " + itoaSafe(res.NoCountry) + " بدون کشور)"
 		}
@@ -384,15 +420,30 @@ func (b *Bot) startRun(c chat) {
 		_, _ = b.api.sendMessage(chatID, "❌ هیچ کانفیگ سالمی در این اسکن یافت نشد.\n\n"+res.Summary(cfg.OutLang))
 	}
 
-	// 2) caption — ALWAYS sent as text directly in chat
+	// 2) Standard Country Emojis (اموجی معمولی کشور)
+	if len(res.CountryCodes) > 0 {
+		var flagList []string
+		for _, iso := range res.CountryCodes {
+			flagList = append(flagList, engine.Flag(iso))
+		}
+		flagsText := strings.Join(flagList, "  ")
+		_, _ = b.api.sendMessage(chatID, "🌍 <b>پرچم‌های استاندارد</b> (جهت کپی):\n\n<code>"+flagsText+"</code>")
+	}
+
+	// 3) Caption
 	if len(res.CountryCodes) > 0 && cfg.CaptionTemplate != "" {
 		caption := b.buildCaption(res.CountryCodes)
 		if caption != "" {
-			_, _ = b.api.sendMessage(chatID, "🏷️ <b>کپشن آماده</b> — کپی کن و با کانفیگ‌ها پست کن:\n\n"+escapeHTML(caption))
+			_, _ = b.api.sendMessage(chatID, "🏷️ <b>کپشن آماده</b>:\n\n"+escapeHTML(caption))
 		}
 	}
 
-	// 4) countries from this run that have no emoji code yet
+	// 4) Message for Users (پیام برای کاربران / داخل کانفیگ)
+	if strings.TrimSpace(cfg.MessageForUsers) != "" {
+		_, _ = b.api.sendMessage(chatID, "💬 <b>پیام برای کاربران | Message for users:</b>\n\n"+escapeHTML(cfg.MessageForUsers))
+	}
+
+	// 5) Missing emoji codes report (Clean vertical list)
 	var missing []string
 	if res.CountryCodes != nil {
 		b.mu.Lock()
@@ -405,45 +456,30 @@ func (b *Bot) startRun(c chat) {
 		}
 	}
 	if len(missing) > 0 {
-		var names []string
-		for _, iso := range missing {
+		var lines []string
+		for i, iso := range missing {
 			flag := engine.Flag(iso)
 			nm, ok := countries.Names(iso, cfg.OutLang)
 			if !ok {
 				nm = iso
 			}
-			names = append(names, flag+" "+nm)
+			lines = append(lines, fmt.Sprintf("%d. %s %s (<code>%s</code>)", i+1, flag, nm, iso))
 		}
-		// EDIT the "اسکن تمام شد" message in place (no new message)
-		b.nav(c,
-			"🎨 <b>این کشورها کد ایموجی ندارند</b>\n\n"+
-				strings.Join(names, "  ·  ")+"\n\n"+
-				"در کپشن برای این‌ها <code>[]</code> خالی جا می‌گیره. کدشون رو از تپ Caption اپ بردار و اینجا وارد کن:",
-			[][]string{
-				{"🎨 کد ایموجی کشورها", "cap:codes"},
-				{"📄 لاگ این اجرا", "runlog"},
-			})
-		b.finishRunGuard()
-		return
+		msg := "🎨 <b>این کشورها کد ایموجی ندارند:</b>\n\n" +
+			strings.Join(lines, "\n") + "\n\n" +
+			"در کپشن برای این‌ها <code>[]</code> خالی قرار گرفته است.\n" +
+			"می‌توانید کدهای آن‌ها را از تب Caption اپ بردارید و با منوی «🏷️ کپشن و پرچم» ثبت نمایید."
+		_, _ = b.api.sendMessage(chatID, msg)
 	}
 
-	// no missing codes: straight to the main menu + run log (same message)
-	{
-		rows := b.menuFor(chatID)
-		rows = append([][]string{{"📄 لاگ این اجرا", "runlog"}}, rows...)
-		b.nav(c, "تمام شد ✅\n\n"+res.Summary(cfg.OutLang)+"\n\n🚀 اسکن بعدی؟", rows)
-	}
 	b.finishRunGuard()
+	b.sendMain(c, "✅ <b>پایان اسکن.</b>\n"+res.Summary(cfg.OutLang)+"\n\nاسکن بعدی؟ کانفیگ‌ها را بفرستید یا دکمه‌های زیر را انتخاب کنید:")
 }
 
-// fitsMsg reports whether s fits in one Telegram message. Telegram counts
-// CHARACTERS, not bytes — Persian/emoji text is 2-4 bytes per rune, so a
-// byte-length check would push small outputs to files too early.
 func fitsMsg(s string) bool {
 	return len([]rune(s)) <= tgTextLimit
 }
 
-// progressBar renders "🟩⬜" (max 20 cells), rounded to the nearest cell.
 func progressBar(done, total int) string {
 	if total <= 0 {
 		return ""
@@ -474,42 +510,33 @@ func (b *Bot) sendRunLog(c chat) {
 	logs := append([]string(nil), b.lastLog...)
 	b.mu.Unlock()
 	if len(logs) == 0 {
-		_, _ = b.api.sendMessage(c.ID, "📄 لاگی ثبت نشده — اول یک اسکن انجام بده.")
+		_, _ = b.api.sendMessage(c.ID, "📄 لاگی ثبت نشده — ابتدا یک اسکن انجام دهید.")
 		return
 	}
 	body := strings.Join(logs, "\n")
 	if fitsMsg(body) {
-		_, _ = b.api.sendMessage(c.ID, "📄 <b>لاگ آخرین اجرا</b>\n\n<pre>"+escapeHTML(body)+"</pre>")
+		_, _ = b.api.sendMessage(c.ID, "📄 <b>لاگ آخرین اجرا:</b>\n\n<pre>"+escapeHTML(body)+"</pre>")
 		return
 	}
 	_ = b.api.sendDocument(c.ID, []byte(body), "cfgscan_run.log",
-		"📄 <b>لاگ آخرین اجرا</b> — بیشتر از یک پیام بود، به‌صورت فایل")
+		"📄 <b>لاگ آخرین اجرا</b> — به‌صورت فایل")
 }
 
 // ------------------------------------------------------------------
 // caption
 
-func (b *Bot) onCaptionMenu(c chat) {
+func (b *Bot) showCaptionMenu(c chat) {
 	b.mu.Lock()
-	hasLast := b.lastCodes != nil
+	b.awaiting = awaitNone
+	b.awaitISO = ""
 	b.mu.Unlock()
-	rows := [][]string{
-		{"✏️ قالب کپشن", "cap:edit"},
-		{"🎨 کد ایموجی کشورها", "cap:codes"},
-	}
-	if hasLast {
-		rows = append(rows, []string{"👁️ پیش‌نمایش کپشن", "cap:preview"})
-	}
-	rows = append(rows,
-		[]string{"↩️ قالب پیش‌فرض", "cap:default"},
-		[]string{"↩️ بازگشت", "menu"})
-	b.nav(c,
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"🏷️ <b>کپشن و پرچم</b>\n\n"+
-			"کپشن = متنی که زیر پستِ کانفیگ‌ها میذاری. سه تیکه داره:\n\n"+
-			"۱. <b>قالب</b> — متن کپشن؛ جای <code>{{FLAGS}}</code> با پرچم‌های کشورهایی که توی آخرین اسکن پیدا شدن پر می‌شه.\n"+
-			"۲. <b>کد ایموجی</b> — اعداد پرچم‌های پریمیوم هر کشور (همون تپ Caption اپ). با کد → پرچم متحرک؛ بدون کد → <code>[]</code> خالی.\n"+
-			"۳. <b>پیش‌نمایش</b> — کپشن نهاییِ همان ران رو قبل از کپی نشونت میده.",
-		rows)
+			"• <b>قالب کپشن</b>: متنی که زیر پست کانفیگ‌ها قرار می‌گیرد (جای <code>{{FLAGS}}</code> با پرچم‌ها پر می‌شود).\n"+
+			"• <b>کد ایموجی</b>: کدهای عددی پرچم‌های متحرک هر کشور (همان تب Caption اپلیکیشن).\n"+
+			"• <b>پیش‌نمایش</b>: مشاهده کپشن نهایی با کشورهای اسکن قبلی.\n\n"+
+			"یکی از گزینه‌های زیر را انتخاب کنید:",
+		b.replyCaptionMenu())
 }
 
 func (b *Bot) captionEditPrompt(c chat) {
@@ -517,11 +544,12 @@ func (b *Bot) captionEditPrompt(c chat) {
 	s := b.settingsLocked()
 	b.awaiting = awaitCaptionTemplate
 	b.mu.Unlock()
-	b.nav(c,
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"✏️ <b>ویرایش قالب کپشن</b>\n\n"+
-			"قالب فعلی:\n<code>"+escapeHTML(s.CaptionTemplate)+"</code>\n\n"+
-			"قالب جدید رو <b>پیست</b> کن (باید <code>{{FLAGS}}</code> داشته باشه).",
-		[][]string{{"✖️ لغو", "caption"}})
+			"قالب فعلی:\n<pre>"+escapeHTML(s.CaptionTemplate)+"</pre>\n\n"+
+			"متن قالب جدید را بفرستید (باید شامل <code>{{FLAGS}}</code> باشد).\n"+
+			"برای لغو، «↩️ بازگشت به منوی اصلی» را بزنید.",
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
 
 func (b *Bot) onCaptionTemplate(c chat, text string) {
@@ -533,16 +561,15 @@ func (b *Bot) onCaptionTemplate(c chat, text string) {
 	}
 	b.save()
 	b.mu.Unlock()
-	b.nav(c, "✅ قالب کپشن ذخیره شد.",
-		[][]string{{"🏷️ کپشن و پرچم", "caption"}, {"↩️ بازگشت", "menu"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, "✅ قالب کپشن با موفقیت ذخیره شد.", b.replyCaptionMenu())
 }
 
 func (b *Bot) captionPreview(c chat) {
 	b.mu.Lock()
 	codes := b.lastCodes
 	b.mu.Unlock()
-	if codes == nil {
-		_, _ = b.api.sendMessage(c.ID, "اول یک اسکن انجام بده تا کشورها ثبت بشن.")
+	if len(codes) == 0 {
+		_, _ = b.api.sendMessage(c.ID, "ابتدا یک اسکن انجام دهید تا کشورهای فعال مشخص شوند.")
 		return
 	}
 	caption := b.buildCaption(codes)
@@ -551,15 +578,12 @@ func (b *Bot) captionPreview(c chat) {
 		return
 	}
 	if fitsMsg(caption) {
-		_, _ = b.api.sendMessage(c.ID, "👁️ <b>پیش‌نمایش کپشن</b> (کشورهای آخرین ران)\n\n"+escapeHTML(caption))
+		_, _ = b.api.sendMessage(c.ID, "👁️ <b>پیش‌نمایش کپشن:</b>\n\n"+escapeHTML(caption))
 		return
 	}
-	_ = b.api.sendDocument(c.ID, []byte(caption), "caption_preview.txt",
-		"👁️ <b>پیش‌نمایش کپشن</b> (بسیار طولانی بود)")
+	_ = b.api.sendDocument(c.ID, []byte(caption), "caption_preview.txt", "👁️ پیش‌نمایش کپشن")
 }
 
-// buildCaption mirrors the app: for each run country (in order), emit the
-// raw [custom_emoji_id] marker when one is registered.
 func (b *Bot) buildCaption(codes []string) string {
 	b.mu.Lock()
 	s := b.settingsLocked()
@@ -579,8 +603,6 @@ func (b *Bot) buildCaption(codes []string) string {
 	return s.CaptionTemplate + "\n" + flagsLine
 }
 
-// onCodesMenu is the app-style codes screen: the last run's countries with
-// flag + name + current code, per-country edit buttons, import/export.
 func (b *Bot) onCodesMenu(c chat) {
 	b.mu.Lock()
 	s := b.settingsLocked()
@@ -589,12 +611,9 @@ func (b *Bot) onCodesMenu(c chat) {
 
 	var sb strings.Builder
 	sb.WriteString("🎨 <b>کد ایموجی کشورها</b>\n\n")
-	sb.WriteString("کد = همون <b>عدد</b>ی که پشت پرچم‌های پریمیوم تلگرامه (تپ Caption اپ هم از همین استفاده می‌کنه).\n")
-	sb.WriteString("• با کد → پرچم متحرک توی کپشن\n")
-	sb.WriteString("• بدون کد → <code>[]</code> خالی جا می‌گیره\n\n")
-	sb.WriteString("📊 ثبت شده: " + itoaSafe(len(s.EmojiCodes)) + " کشور\n")
-	if codes != nil {
-		sb.WriteString("\n🌍 <b>کشورهای آخرین ران:</b>\n")
+	sb.WriteString("📊 تعداد کدهای ثبت‌شده: <b>" + itoaSafe(len(s.EmojiCodes)) + "</b> کشور\n\n")
+	if len(codes) > 0 {
+		sb.WriteString("🌍 <b>کشورهای آخرین اسکن:</b>\n")
 		for _, iso := range codes {
 			flag := engine.Flag(iso)
 			name, ok := countries.Names(iso, s.OutLang)
@@ -602,83 +621,28 @@ func (b *Bot) onCodesMenu(c chat) {
 				name = iso
 			}
 			if v, has := s.EmojiCodes[iso]; has && v != "" {
-				sb.WriteString(fmt.Sprintf("%s %s — <code>%s</code>\n", flag, name, v))
+				sb.WriteString(fmt.Sprintf("• %s %s (%s) ➔ <code>%s</code>\n", flag, name, iso, v))
 			} else {
-				sb.WriteString(fmt.Sprintf("%s %s — <b>بدون کد</b>\n", flag, name))
+				sb.WriteString(fmt.Sprintf("• %s %s (%s) ➔ <b>بدون کد</b>\n", flag, name, iso))
 			}
 		}
-		sb.WriteString("\nروی دکمه‌ی هر کشور بزن تا کدش رو ثبت / عوض کنی.")
+		sb.WriteString("\nبرای ثبت یا تغییر کد، می‌توانید پیام را با فرمت <code>XX=code</code> بفرستید (مثلاً <code>DE=5390843037349679256</code>).\n")
 	} else {
-		sb.WriteString("\n(اول یک اسکن انجام بده تا کشورهای آخرین ران اینجا بیاد)\n")
-		sb.WriteString("📥/📤 همون فایل بکاپ تپ Caption اپ هست — هر دو طرف راحت می‌خونه و آپدیت می‌مونه.")
+		sb.WriteString("می‌توانید کدهای بکاپ اپ را با دکمه‌ی «📥 وارد کردن دسته‌ای کدها» وارد کنید یا کد هر کشور را با فرمت <code>XX=code</code> بفرستید.\n")
 	}
 
-	rows := [][]string{}
-	for _, iso := range codes {
-		flag := engine.Flag(iso)
-		name, ok := countries.Names(iso, s.OutLang)
-		if !ok {
-			name = iso
-		}
-		rows = append(rows, []string{"✏️ " + flag + " " + name, "cap:set:" + iso})
-	}
-	rows = append(rows,
-		[]string{"📥 وارد کردن کدها", "cap:import"},
-		[]string{"📤 خروجی گرفتن کدها", "cap:export"},
-		[]string{"↩️ بازگشت", "caption"})
-	b.nav(c, sb.String(), rows)
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, sb.String(), b.replyCaptionMenu())
 }
 
-// setCodePrompt asks for one country's numeric custom-emoji id.
-func (b *Bot) setCodePrompt(c chat, iso string) {
-	b.mu.Lock()
-	b.awaiting = awaitCodeSet
-	b.awaitISO = iso
-	b.mu.Unlock()
-	flag := engine.Flag(iso)
-	name, _ := countries.Names(iso, "fa")
-	b.nav(c,
-		"✏️ <b>کد ایموجی: "+flag+" "+name+"</b>\n\n"+
-			"کد = <b>عدد</b> پشت ایموجی پریمیوم.\n"+
-			"در تلگرام: روی پرچمِ پریمیومِ کشور نگه‌دار → کد عددی‌اش را کپی کن و اینجا بفرست.\n"+
-			"(یا از تپ Caption اپ بردار.)\n\n"+
-			"برای حذف کد بنویس: <code>delete</code>",
-		[][]string{{"✖️ لغو", "cap:codes"}})
-}
-
-func (b *Bot) onSetCode(c chat, iso, text string) {
-	text = strings.TrimSpace(text)
-	b.mu.Lock()
-	if strings.EqualFold(text, "delete") {
-		delete(b.settings.EmojiCodes, iso)
-	} else if text != "" {
-		b.settings.EmojiCodes[iso] = text
-	}
-	b.save()
-	b.mu.Unlock()
-	flag := engine.Flag(iso)
-	name, _ := countries.Names(iso, "fa")
-	var msg string
-	if strings.EqualFold(text, "delete") {
-		msg = "🗑️ کد "+flag+" "+name+" حذف شد."
-	} else {
-		msg = "✅ کد "+flag+" "+name+": <code>"+escapeHTML(text)+"</code>"
-	}
-	b.nav(c, msg,
-		[][]string{{"🎨 کد ایموجی کشورها", "cap:codes"}, {"↩️ بازگشت", "menu"}})
-}
-
-// importPrompt asks for the app's exported codes text (paste or .txt file).
 func (b *Bot) importPrompt(c chat) {
 	b.mu.Lock()
 	b.awaiting = awaitCodesImport
 	b.mu.Unlock()
-	b.nav(c,
-		"📥 <b>وارد کردن کدها</b>\n\n"+
-			"توی اپ: تپ <b>Caption</b> → دکمه‌ی «کپی کدها» → اینجا <b>پیست</b> کن —\n"+
-			"یا مستقیم <b>فایل بکاپ .txt</b> اپ رو بفرست.\n\n"+
-			"فرمت: هر خط <code>XX=کد</code>، مثلاً:\n<code>DE=6050626661043411760\nFR=5395616385734833119</code>",
-		[][]string{{"✖️ لغو", "cap:codes"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		"📥 <b>وارد کردن دسته‌ای کدها</b>\n\n"+
+			"در اپلیکیشن: تب <b>Caption</b> ➔ دکمه‌ی «کپی کدها» ➔ اینجا <b>پیست</b> کنید — یا فایل .txt را بفرستید.\n\n"+
+			"فرمت: هر خط <code>XX=کد</code>، مانند:\n<code>DE=6050626661043411760\nFR=5395616385734833119</code>",
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
 
 func (b *Bot) onCodesImport(c chat, text string) {
@@ -708,13 +672,11 @@ func (b *Bot) onCodesImport(c chat, text string) {
 	total := len(b.settings.EmojiCodes)
 	b.save()
 	b.mu.Unlock()
-	b.nav(c,
-		fmt.Sprintf("✅ <b>%d کد</b> وارد شد. کل کدهای ثبت‌شده: <b>%d</b>", added, total),
-		[][]string{{"🎨 کد ایموجی کشورها", "cap:codes"}, {"↩️ بازگشت", "menu"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		fmt.Sprintf("✅ <b>%d کد</b> ذخیره شد. مجموع کدهای ثبت‌شده: <b>%d</b>", added, total),
+		b.replyCaptionMenu())
 }
 
-// exportCodesText produces exactly the app's backup format, so the app's
-// «بازیابی از فایل» accepts it as-is (and vice versa).
 func (b *Bot) exportCodesText() string {
 	b.mu.Lock()
 	s := b.settingsLocked()
@@ -735,61 +697,87 @@ func (b *Bot) exportCodesText() string {
 func (b *Bot) onCodesExport(c chat) {
 	t := b.exportCodesText()
 	if t == "" {
-		b.nav(c,
-			"🤔 هنوز کدی ثبت نشده.\nاول کدها رو وارد کن (📥) یا تک‌تک ثبت کن.",
-			[][]string{{"🎨 کد ایموجی کشورها", "cap:codes"}})
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 هنوز کدی ثبت نشده است.", b.replyCaptionMenu())
 		return
 	}
 	_, _ = b.api.sendMessage(c.ID,
-		"📤 <b>خروجی گرفتن کدها</b> — فرمت مشترک اپ و ربات\n\n"+
-			"کپی کن؛ توی اپ: تپ Caption → <b>بازیابی از فایل</b> → پیست کن:\n\n<pre>"+escapeHTML(t)+"</pre>")
+		"📤 <b>خروجی کدهای ایموجی</b> (فرمت مشترک اپ و ربات):\n\n<pre>"+escapeHTML(t)+"</pre>")
+}
+
+// ------------------------------------------------------------------
+// Message For Users (پیام برای کاربران / داخل کانفیگ)
+
+func (b *Bot) showMsgForUsersMenu(c chat) {
+	b.mu.Lock()
+	b.awaiting = awaitNone
+	b.awaitISO = ""
+	s := b.settingsLocked()
+	b.mu.Unlock()
+
+	msg := "✏️ <b>پیام برای کاربران | Message for users</b>\n\n" +
+		"این پیام پس از اتمام اسکن، به عنوان یک پیام جداگانه ارسال می‌شود تا بتوانید آن را به راحتی کپی کنید و در کانال یا توضیحات کانفیگ قرار دهید.\n\n"
+	if strings.TrimSpace(s.MessageForUsers) != "" {
+		msg += "📄 <b>متن فعلی:</b>\n<pre>" + escapeHTML(s.MessageForUsers) + "</pre>"
+	} else {
+		msg += "<i>(هنوز متنی ثبت نشده است)</i>"
+	}
+
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMsgForUsersMenu())
+}
+
+func (b *Bot) msgForUsersPrompt(c chat) {
+	b.mu.Lock()
+	b.awaiting = awaitMessageForUsers
+	b.mu.Unlock()
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		"✏️ <b>تنظیم متن پیام برای کاربران</b>\n\n"+
+			"متن دلخواه خود را ارسال کنید (مثلاً لینک کانال، توضیحات، آیدی و ...):\n\n"+
+			"<pre>🎯 ساخته شده توسط کانال | Made by @wpnfa\n\nT.me/wpnfa\n\n🌍 آپدیت روزانه | Daily update</pre>",
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
+}
+
+func (b *Bot) onSetMessageForUsers(c chat, text string) {
+	b.mu.Lock()
+	b.settings.MessageForUsers = text
+	b.save()
+	b.mu.Unlock()
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		"✅ <b>متن پیام برای کاربران ذخیره شد:</b>\n\n<pre>"+escapeHTML(text)+"</pre>",
+		b.replyMsgForUsersMenu())
+}
+
+func (b *Bot) onClearMessageForUsers(c chat) {
+	b.mu.Lock()
+	b.settings.MessageForUsers = ""
+	b.save()
+	b.mu.Unlock()
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, "🗑️ پیام برای کاربران حذف شد.", b.replyMsgForUsersMenu())
 }
 
 // ------------------------------------------------------------------
 // settings
 
-var parallelSteps = []int{2, 3, 4, 6, 8}
-var timeoutSteps = []int{5, 10, 15, 20, 30}
+var (
+	parallelSteps = []int{2, 3, 4, 6, 8}
+	timeoutSteps  = []int{5, 10, 15, 20, 30}
+)
 
-func (b *Bot) onSettingsMenu(c chat) {
+func (b *Bot) showSettingsMenu(c chat) {
 	b.mu.Lock()
-	s := b.settingsLocked()
+	b.awaiting = awaitNone
+	b.awaitISO = ""
 	b.mu.Unlock()
-	langName := "فارسی"
-	if s.OutLang == "en" {
-		langName = "English"
-	}
-	chState := "خاموش"
-	if s.IncludeChannel {
-		if s.Channel != "" {
-			chState = "روشن (| " + s.Channel + ")"
-		} else {
-			chState = "روشن — بدون اسم!"
-		}
-	}
-	unkState := "خاموش"
-	if s.IncludeUnknown {
-		unkState = "روشن"
-	}
-	rows := [][]string{
-		{fmt.Sprintf("🔢 همزمانی: %d", s.Parallel), "set:parallel"},
-		{fmt.Sprintf("⏱️ تایم‌اوت: %d ثانیه", s.TimeoutSec), "set:timeout"},
-		{fmt.Sprintf("🌐 زبان اسم: %s", langName), "set:lang"},
-		{fmt.Sprintf("📢 سافیکس کانال: %s", chState), "set:channel"},
-		{fmt.Sprintf("🔗 خروجی بدون کشور: %s", unkState), "set:unknown"},
-		{"↩️ بازگشت", "menu"},
-	}
-	b.nav(c,
-		"⚙️ <b>تنظیمات</b>\n\n"+
-			"روی هر گزینه بزن تا تغییر کنه — همه ذخیره می‌شن.\n\n"+
-			"📢 سافیکس کانال = به آخر اسم هر کانفیگ « | اسم_کانال» اضافه بشه (مثل اپ).\n"+
-			"🔗 خروجی بدون کشور = لینک‌های «وصل شد ولی کشور نگرفت» توی لیست لینک‌ها بیان یا نه.",
-		rows)
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		"⚙️ <b>تنظیمات ربات</b>\n\n"+
+			"• <b>همزمانی</b>: تعداد سرورهایی که همزمان اسکن می‌شوند.\n"+
+			"• <b>تایم‌اوت</b>: حداکثر زمان انتظار برای پاسخ هر سرور.\n"+
+			"• <b>زبان اسم</b>: فارسی یا English برای نام کشورها.\n"+
+			"• <b>سافیکس کانال</b>: اضافه کردن « | اسم_کانال» به انتهای نام کانفیگ‌ها.\n"+
+			"• <b>خروجی بدون کشور</b>: اضافه کردن لینک‌هایی که کشورشان مشخص نشده در لیست خروجی.\n\n"+
+			"روی گزینه‌های زیر لمس کنید تا تغییر کنند:",
+		b.replySettingsMenu())
 }
 
-// cycleSetting flips one setting. IMPORTANT: mutate b.settings directly under
-// the lock — settingsLocked() returns a copy and saving after mutating the
-// copy silently loses the change (v1.0.7 regression fix).
 func (b *Bot) cycleSetting(c chat, key string) {
 	b.mu.Lock()
 	switch key {
@@ -807,34 +795,30 @@ func (b *Bot) cycleSetting(c chat, key string) {
 		}
 	case "channel":
 		b.settings.IncludeChannel = !b.settings.IncludeChannel
-		on := b.settings.IncludeChannel
-		noName := b.settings.Channel == ""
-		if on && noName {
-			b.awaiting = awaitChannelName
-		}
-		b.save()
-		b.mu.Unlock()
-		if on && noName {
-			b.nav(c,
-				"📢 <b>سافیکس کانال روشن شد</b>\n\n"+
-					"اسم کانال رو <b>پیست</b> کن (مثلاً <code>Wpnfa</code>) — به آخر اسم همه کانفیگ‌ها اضافه می‌شه:\n\n"+
-					"<pre>🇩 آلمان | Wpnfa</pre>",
-				[][]string{{"✖️ لغو و خاموش کردن", "set:channel"}})
-			return
-		}
-		state := "خاموش"
-		if on {
-			state = "روشن"
-		}
-		b.nav(c, fmt.Sprintf("📢 سافیکس کانال <b>%s</b> شد.", state),
-			[][]string{{"⚙️ تنظیمات", "settings"}})
-		return
 	case "unknown":
 		b.settings.IncludeUnknown = !b.settings.IncludeUnknown
 	}
 	b.save()
 	b.mu.Unlock()
-	b.onSettingsMenu(c)
+	b.showSettingsMenu(c)
+}
+
+func (b *Bot) channelNamePrompt(c chat) {
+	b.mu.Lock()
+	b.awaiting = awaitChannelName
+	s := b.settingsLocked()
+	b.mu.Unlock()
+	cur := s.Channel
+	if cur == "" {
+		cur = "(خالی)"
+	}
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		"📢 <b>تنظیم نام کانال (سافیکس)</b>\n\n"+
+			"نام فعلی: <code>"+escapeHTML(cur)+"</code>\n\n"+
+			"نام جدید را بفرستید (مثلاً <code>Wpnfa</code>) تا به انتهای نام همه کانفیگ‌ها اضافه شود:\n"+
+			"<pre>🇩🇪 آلمان | Wpnfa</pre>\n\n"+
+			"برای حذف نام، عبارت <code>delete</code> را بفرستید.",
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
 
 // ------------------------------------------------------------------
@@ -849,28 +833,18 @@ func (b *Bot) onAdminMenu(c chat) {
 	s := b.settingsLocked()
 	b.mu.Unlock()
 	var sb strings.Builder
-	sb.WriteString("👥 <b>ادمین‌ها</b>\n\n")
-	sb.WriteString("افزودن / حذف افرادی که به ربات دسترسی دارن.\nصاحب ربات همیشه دسترسی کامل داره و توی لیست نیازی به ثبت نداره.\n\n")
-	sb.WriteString("👑 صاحب: <code>" + itoaSafe(int(b.ownerID)) + "</code>\n")
+	sb.WriteString("👥 <b>ادمین‌های ربات</b>\n\n")
+	sb.WriteString("👑 مالک اصلی: <code>" + itoaSafe(int(b.ownerID)) + "</code>\n\n")
 	if len(s.Admins) == 0 {
-		sb.WriteString("\n(ادمین اضافه‌ای ثبت نشده)\n")
-	}
-	rows := [][]string{}
-	var row []string
-	for _, a := range s.Admins {
-		row = append(row, "❌ "+itoaSafe(int(a)), "admin:rm:"+itoaSafe(int(a)))
-		if len(row) == 4 { // two buttons per row
-			rows = append(rows, row)
-			row = nil
+		sb.WriteString("<i>(هیچ ادمین اضافی ثبت نشده است)</i>\n")
+	} else {
+		sb.WriteString("<b>لیست ادمین‌ها:</b>\n")
+		for i, a := range s.Admins {
+			sb.WriteString(fmt.Sprintf("%d. <code>%d</code>\n", i+1, a))
 		}
 	}
-	if len(row) > 0 {
-		rows = append(rows, row)
-	}
-	rows = append(rows,
-		[]string{"➕ افزودن ادمین", "admin:add"},
-		[]string{"↩️ بازگشت", "menu"})
-	b.nav(c, sb.String(), rows)
+	sb.WriteString("\nبرای افزودن ادمین روی «➕ افزودن ادمین» بزنید یا برای حذف، <code>/rmadmin ID</code> را ارسال کنید.")
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, sb.String(), b.replyAdminMenu())
 }
 
 func (b *Bot) adminAddPrompt(c chat) {
@@ -881,11 +855,11 @@ func (b *Bot) adminAddPrompt(c chat) {
 	b.mu.Lock()
 	b.awaiting = awaitAdminAdd
 	b.mu.Unlock()
-	b.nav(c,
-		"➕ <b>افزودن ادمین</b>\n\n"+
-			"<b>ID عددی</b> اون شخص رو بفرست.\n"+
-			"روش گرفتن ID: اون شخص کافیه <code>/id</code> رو به همین ربات بفرسته تا IDش برگرده.",
-		[][]string{{"✖️ لغو", "admins"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		"➕ <b>افزودن ادمین جدید</b>\n\n"+
+			"<b>آیدی عددی</b> شخص مورد نظر را بفرستید.\n"+
+			"(آن شخص می‌تواند با ارسال <code>/id</code> به همین ربات، آیدی خود را دریافت کند)",
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
 
 func (b *Bot) onAdminAdd(c chat, text string) {
@@ -896,16 +870,13 @@ func (b *Bot) onAdminAdd(c chat, text string) {
 	idStr := strings.TrimSpace(strings.TrimPrefix(text, "@"))
 	id, ok := parseID(idStr)
 	if !ok || id <= 0 {
-		b.nav(c,
-			"🤔 این یک ID عددی معتبر نیست.\nعدد را از دستورات <code>/id</code> بگیرید (مثلاً <code>123456789</code>).",
-			[][]string{{"👥 ادمین‌ها", "admins"}})
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 آیدی عددی معتبر نیست.", b.replyAdminMenu())
 		return
 	}
 	b.mu.Lock()
 	if id == b.ownerID {
 		b.mu.Unlock()
-		b.nav(c, "شما خودتان صاحب ربات هستید و همیشه دسترسی کامل دارید 🙂",
-			[][]string{{"👥 ادمین‌ها", "admins"}})
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "شما مالک ربات هستید و دسترسی کامل دارید.", b.replyAdminMenu())
 		return
 	}
 	dup := false
@@ -919,15 +890,9 @@ func (b *Bot) onAdminAdd(c chat, text string) {
 	}
 	b.save()
 	b.mu.Unlock()
-	if dup {
-		b.nav(c, "این ID قبلاً ثبت شده بود.",
-			[][]string{{"👥 ادمین‌ها", "admins"}})
-		return
-	}
-	b.nav(c,
-		"✅ <code>"+itoaSafe(int(id))+"</code> به‌عنوان ادمین اضافه شد.\n"+
-			"از این به بعد تمام امکانات ربات (اسکن، تنظیمات، کپشن) در دسترس اوست.",
-		[][]string{{"👥 ادمین‌ها", "admins"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		fmt.Sprintf("✅ کاربر <code>%d</code> با موفقیت به عنوان ادمین ثبت شد.", id),
+		b.replyAdminMenu())
 }
 
 func (b *Bot) onAdminRemove(c chat, idStr string) {
@@ -953,13 +918,12 @@ func (b *Bot) onAdminRemove(c chat, idStr string) {
 	b.save()
 	b.mu.Unlock()
 	if !removed {
-		b.nav(c, "این ID توی لیست نبود.",
-			[][]string{{"👥 ادمین‌ها", "admins"}})
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "این آیدی در لیست ادمین‌ها نبود.", b.replyAdminMenu())
 		return
 	}
-	b.nav(c,
-		"🗑️ <code>"+itoaSafe(int(id))+"</code> از ادمین‌ها حذف شد و دسترسی‌اش قطع شد.",
-		[][]string{{"👥 ادمین‌ها", "admins"}})
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		fmt.Sprintf("🗑️ دسترسی کاربر <code>%d</code> قطع شد.", id),
+		b.replyAdminMenu())
 }
 
 func parseID(s string) (int64, bool) {
@@ -987,19 +951,16 @@ func (b *Bot) onAbout(c chat) {
 	if s.OutLang == "en" {
 		langName = "English"
 	}
-	b.nav(c,
-		"ℹ️ <b>ConfigScanner Bot</b> <code>v"+BotVersion+"</code>\n\n"+
-			"• 📡 هر سرور با یک پروسس xray جدا و تخصیص اتمیک پورت تست می‌شه\n"+
-			"• 💨 hy2 (سالمندر/جکوهو) با هسته‌ی اصلی hysteria — دقیقاً مثل اپ\n"+
-			"• 🔒 لینک‌های <code>insecure=1</code> با پین کردن گواهی تست می‌شن (مثل اپ)\n"+
-			"• 🧩 پشتیبانی کامل از TCP Fragment و تنظیمات پیشرفته ECH\n"+
-			"• 🌐 ۶ سرویس جیو به‌صورت کاملاً موازی + رأی‌گیری سریع\n"+
-			"• 📉 fallback HTTP ساده (ip-api) برای خروجی‌هایی که TLS رو می‌بندن\n"+
-			"• 🏷️ اسم یکتا برای هر خروجی بدون شماره‌های اضافی\n"+
-			"• 🎨 کپشن با custom emoji + ورودی/خروجی کدها با اپ\n\n"+
-			"⚙️ فعلی: "+itoaSafe(s.Parallel)+" همزمان · "+itoaSafe(s.TimeoutSec)+" ثانیه · "+langName+
-			"\n\n⚠️ نکته: نتیجه‌ها از دید IP سرور (Railway) هستن؛ بعضی سرورها دیتاسنتر رو فیلتر می‌کنن و از ایران سالم‌ان.",
-		[][]string{{"↩️ بازگشت", "menu"}})
+	msg := "ℹ️ <b>ConfigScanner Bot</b> <code>v" + BotVersion + "</code>\n\n" +
+		"• 📡 تست هر سرور با پروسس اختصاصی Xray و تخصیص اتمیک پورت\n" +
+		"• 💨 هسته بومی Hysteria 2 برای لینک‌های سلامندر و جکوهو\n" +
+		"• 🔒 پین کردن خودکار گواهی TLS برای سرورهای insecure\n" +
+		"• 🧩 پشتیبانی از TCP Fragment، ECH و تنظیمات پیشرفته xhttp\n" +
+		"• 🌐 استعلام ۶ سرویس جیو به‌صورت موازی و نام‌گذاری استاندارد\n" +
+		"• 🏷️ خروجی تمیز بدون ارقام و شماره‌های اضافی\n" +
+		"• 🎨 کپشن، پیام برای کاربران و سازگاری کامل با اپلیکیشن اندروید\n\n" +
+		"⚙️ تنظیمات فعلی: " + itoaSafe(s.Parallel) + " همزمان · " + itoaSafe(s.TimeoutSec) + " ثانیه · " + langName
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMainMenuFor(c.ID, 0))
 }
 
 // ------------------------------------------------------------------
@@ -1018,68 +979,7 @@ func (b *Bot) handleUpdate(u update) {
 	}
 
 	if u.CallbackQuery != nil {
-		cq := u.CallbackQuery
-		if cq.From != nil && !b.isAllowed(cq.From.ID) {
-			return
-		}
-		b.mu.Lock()
-		running := b.running
-		b.mu.Unlock()
-		data := cq.Data
-		b.api.answerCallback(cq.ID, "")
-		if running {
-			if data == "noop" {
-				return
-			}
-			_, _ = b.api.sendMessage(c.ID, "⏳ اسکن در حال اجراست — صبر کن تمام شود.")
-			return
-		}
-		switch {
-		case data == "menu":
-			b.sendMain(c, "")
-		case data == "scan":
-			b.onScanRequest(c)
-		case data == "scan:start":
-			b.startRun(c)
-		case data == "scan:cancel":
-			b.cancelPending(c)
-		case data == "settings":
-			b.onSettingsMenu(c)
-		case data == "caption":
-			b.onCaptionMenu(c)
-		case data == "cap:edit":
-			b.captionEditPrompt(c)
-		case data == "cap:codes":
-			b.onCodesMenu(c)
-		case strings.HasPrefix(data, "cap:set:"):
-			b.setCodePrompt(c, strings.TrimPrefix(data, "cap:set:"))
-		case data == "cap:import":
-			b.importPrompt(c)
-		case data == "cap:export":
-			b.onCodesExport(c)
-		case data == "cap:preview":
-			b.captionPreview(c)
-		case data == "cap:default":
-			b.mu.Lock()
-			b.settings.CaptionTemplate = DefaultCaptionTemplate
-			b.save()
-			b.mu.Unlock()
-			b.nav(c, "↩️ قالب پیش‌فرض برگشت.",
-				[][]string{{"🏷️ کپشن و پرچم", "caption"}})
-		case data == "runlog":
-			b.sendRunLog(c)
-		case strings.HasPrefix(data, "set:"):
-			b.cycleSetting(c, strings.TrimPrefix(data, "set:"))
-		case data == "about":
-			b.onAbout(c)
-		case data == "admins":
-			b.onAdminMenu(c)
-		case data == "admin:add":
-			b.adminAddPrompt(c)
-		case strings.HasPrefix(data, "admin:rm:"):
-			b.onAdminRemove(c, strings.TrimPrefix(data, "admin:rm:"))
-		case data == "noop":
-		}
+		b.api.answerCallback(u.CallbackQuery.ID, "")
 		return
 	}
 
@@ -1098,56 +998,129 @@ func (b *Bot) handleUpdate(u update) {
 		}
 	}
 	if text == "" {
-		_, _ = b.api.sendMessage(c.ID, "فقط متن یا فایل .txt بفرست.")
+		_, _ = b.api.sendMessage(c.ID, "لطفاً متن کانفیگ یا فایل .txt ارسال کنید.")
 		return
 	}
 
 	cleanText := strings.TrimSpace(text)
 	lowerText := strings.ToLower(cleanText)
 
+	// Single country code quick setting: "DE=5390843037349679256"
+	if len(cleanText) >= 4 && strings.Contains(cleanText, "=") && !strings.Contains(cleanText, "://") {
+		parts := strings.SplitN(cleanText, "=", 2)
+		iso := strings.ToUpper(strings.TrimSpace(parts[0]))
+		val := strings.TrimSpace(parts[1])
+		if len(iso) == 2 && val != "" {
+			b.mu.Lock()
+			if b.settings.EmojiCodes == nil {
+				b.settings.EmojiCodes = map[string]string{}
+			}
+			if strings.EqualFold(val, "delete") {
+				delete(b.settings.EmojiCodes, iso)
+			} else {
+				b.settings.EmojiCodes[iso] = val
+			}
+			b.save()
+			b.mu.Unlock()
+			flag := engine.Flag(iso)
+			nm, _ := countries.Names(iso, "fa")
+			_, _ = b.api.sendMessage(c.ID, fmt.Sprintf("✅ کد ایموجی %s %s (%s) ذخیره شد: <code>%s</code>", flag, nm, iso, val))
+			return
+		}
+	}
+
 	switch {
-	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو":
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.pending = nil
-		b.mu.Unlock()
+	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو" || cleanText == "↩️ بازگشت به منوی اصلی" || cleanText == "↩️ منوی اصلی":
 		b.sendMain(c, "")
 		return
 	case cleanText == "📡 اسکن کانفیگ" || lowerText == "/scan":
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.mu.Unlock()
 		b.onScanRequest(c)
 		return
+	case strings.HasPrefix(cleanText, "▶️ شروع اسکن") || cleanText == "شروع اسکن" || cleanText == "شروع" || lowerText == "/run" || lowerText == "/start_scan":
+		b.startRun(c)
+		return
+	case cleanText == "🗑️ پاک کردن لیست" || cleanText == "پاک کردن لیست" || cleanText == "حذف لیست":
+		b.cancelPending(c)
+		return
 	case cleanText == "⚙️ تنظیمات" || lowerText == "/settings":
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.mu.Unlock()
-		b.onSettingsMenu(c)
+		b.showSettingsMenu(c)
+		return
+	case strings.HasPrefix(cleanText, "🔢 همزمانی"):
+		b.cycleSetting(c, "parallel")
+		return
+	case strings.HasPrefix(cleanText, "⏱️ تایم‌اوت"):
+		b.cycleSetting(c, "timeout")
+		return
+	case strings.HasPrefix(cleanText, "🌐 زبان"):
+		b.cycleSetting(c, "lang")
+		return
+	case strings.HasPrefix(cleanText, "📢 سافیکس"):
+		b.cycleSetting(c, "channel")
+		return
+	case cleanText == "📢 تنظیم نام کانال":
+		b.channelNamePrompt(c)
+		return
+	case strings.HasPrefix(cleanText, "🔗 خروجی بدون کشور"):
+		b.cycleSetting(c, "unknown")
 		return
 	case cleanText == "🏷️ کپشن و پرچم" || lowerText == "/caption":
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.mu.Unlock()
-		b.onCaptionMenu(c)
+		b.showCaptionMenu(c)
 		return
-	case cleanText == "ℹ️ درباره" || lowerText == "/about":
+	case cleanText == "✏️ ویرایش قالب کپشن":
+		b.captionEditPrompt(c)
+		return
+	case cleanText == "🎨 کدهای ایموجی کشورها":
+		b.onCodesMenu(c)
+		return
+	case cleanText == "👁️ پیش‌نمایش کپشن":
+		b.captionPreview(c)
+		return
+	case cleanText == "↩️ بازگردانی قالب پیش‌فرض":
 		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
+		b.settings.CaptionTemplate = DefaultCaptionTemplate
+		b.save()
 		b.mu.Unlock()
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "↩️ قالب کپشن به حالت پیش‌فرض بازگشت.", b.replyCaptionMenu())
+		return
+	case cleanText == "📥 وارد کردن دسته‌ای کدها":
+		b.importPrompt(c)
+		return
+	case cleanText == "📤 خروجی گرفتن کدها":
+		b.onCodesExport(c)
+		return
+	case cleanText == "✏️ پیام برای کاربران" || lowerText == "/message":
+		b.showMsgForUsersMenu(c)
+		return
+	case cleanText == "✏️ تنظیم / ویرایش متن":
+		b.msgForUsersPrompt(c)
+		return
+	case cleanText == "👁️ مشاهده متن فعلی":
+		b.mu.Lock()
+		s := b.settingsLocked()
+		b.mu.Unlock()
+		if strings.TrimSpace(s.MessageForUsers) == "" {
+			_, _ = b.api.sendWithReplyKeyboard(c.ID, "<i>(هنوز متنی ثبت نشده است)</i>", b.replyMsgForUsersMenu())
+		} else {
+			_, _ = b.api.sendWithReplyKeyboard(c.ID, "📄 <b>متن فعلی پیام برای کاربران:</b>\n\n<pre>"+escapeHTML(s.MessageForUsers)+"</pre>", b.replyMsgForUsersMenu())
+		}
+		return
+	case cleanText == "🗑️ حذف متن پیام":
+		b.onClearMessageForUsers(c)
+		return
+	case cleanText == "📊 گزارش / لاگ" || lowerText == "/log":
+		b.sendRunLog(c)
+		return
+	case cleanText == "ℹ️ راهنما و درباره" || cleanText == "ℹ️ درباره" || lowerText == "/about":
 		b.onAbout(c)
 		return
-	case cleanText == "👥 ادمین‌ها" || lowerText == "/admins":
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.mu.Unlock()
+	case cleanText == "👥 ادمین‌ها" || cleanText == "📋 لیست ادمین‌ها" || lowerText == "/admins":
 		b.onAdminMenu(c)
+		return
+	case cleanText == "➕ افزودن ادمین":
+		b.adminAddPrompt(c)
+		return
+	case strings.HasPrefix(lowerText, "/rmadmin "):
+		b.onAdminRemove(c, strings.TrimPrefix(lowerText, "/rmadmin "))
 		return
 	case lowerText == "/id":
 		_, _ = b.api.sendMessage(c.ID, fmt.Sprintf("ID شما: <code>%d</code>", c.ID))
@@ -1162,11 +1135,11 @@ func (b *Bot) handleUpdate(u update) {
 		return
 	}
 
-	// awaiting input
+	// Awaiting state
 	b.mu.Lock()
 	aw := b.awaiting
-	iso := b.awaitISO
 	b.mu.Unlock()
+
 	switch aw {
 	case awaitCaptionTemplate:
 		b.mu.Lock()
@@ -1178,20 +1151,20 @@ func (b *Bot) handleUpdate(u update) {
 		b.mu.Lock()
 		b.awaiting = awaitNone
 		name := strings.TrimSpace(strings.TrimPrefix(text, "@"))
-		if name == "" {
-			// empty name: turn the feature back off so the state is honest
+		if name == "" || strings.EqualFold(name, "delete") {
+			b.settings.Channel = ""
 			b.settings.IncludeChannel = false
 			b.save()
 			b.mu.Unlock()
-			b.nav(c, "📢 لغو شد (اسم خالی) — سافیکس کانال خاموش است.",
-				[][]string{{"⚙️ تنظیمات", "settings"}})
+			_, _ = b.api.sendWithReplyKeyboard(c.ID, "📢 نام کانال حذف شد و سافیکس خاموش گردید.", b.replySettingsMenu())
 		} else {
 			b.settings.Channel = name
+			b.settings.IncludeChannel = true
 			b.save()
 			b.mu.Unlock()
-			b.nav(c,
-				"✅ سافیکس کانال <b>روشن</b>: به آخر همه اسم‌ها <b> | "+escapeHTML(name)+"</b> اضافه می‌شه",
-				[][]string{{"⚙️ تنظیمات", "settings"}})
+			_, _ = b.api.sendWithReplyKeyboard(c.ID,
+				"✅ سافیکس کانال <b>روشن</b> شد:\n<pre>🇩🇪 آلمان | "+escapeHTML(name)+"</pre>",
+				b.replySettingsMenu())
 		}
 		return
 	case awaitAdminAdd:
@@ -1206,21 +1179,21 @@ func (b *Bot) handleUpdate(u update) {
 		b.mu.Unlock()
 		b.onCodesImport(c, text)
 		return
-	case awaitCodeSet:
+	case awaitMessageForUsers:
 		b.mu.Lock()
 		b.awaiting = awaitNone
-		b.awaitISO = ""
 		b.mu.Unlock()
-		b.onSetCode(c, iso, text)
+		b.onSetMessageForUsers(c, text)
 		return
 	}
 
-	// default: treat as config input when it looks like configs
+	// Config input
 	t := strings.TrimSpace(text)
 	if strings.Contains(t, "://") {
 		b.onConfigInput(c, text)
 		return
 	}
+
 	b.sendMain(c, "")
 }
 
@@ -1234,12 +1207,6 @@ func (b *Bot) Loop() error {
 	for {
 		ups, err := b.api.getUpdates(offset+1, 50)
 		if err != nil {
-			// Telegram only retains ~24h of updates. After a restart the
-			// offset starts at 0; when the bot's last updates are older
-			// than that window the API answers "You reached the start of
-			// the range" and polling would loop forever on the same stale
-			// offset. Jump to the tail: an offset beyond the latest update
-			// returns an empty list, and polling resumes from the present.
 			if strings.Contains(err.Error(), "start of the range") {
 				fmt.Println("getUpdates: start of the range - resetting offset to tail")
 				offset = 1 << 60

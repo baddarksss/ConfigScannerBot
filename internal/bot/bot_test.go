@@ -13,7 +13,7 @@ import (
 func TestCycleSettingPersists(t *testing.T) {
 	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
 	b.mu.Lock()
-	b.settings.Channel = "Wpnfa" // a name exists so no prompt appears
+	b.settings.Channel = "Wpnfa" // a name exists
 	b.mu.Unlock()
 
 	c := chat{ID: 1}
@@ -52,16 +52,44 @@ func TestCycleSettingPersists(t *testing.T) {
 	}
 }
 
-// nav edits in place: a second nav() call must not error when there is a
-// remembered message (the api errors here because "token" is fake, so we
-// only assert the flow runs without panic and records no message id).
-func TestNavFlowNoPanic(t *testing.T) {
+func TestReplyMenuStructure(t *testing.T) {
 	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
-	c := chat{ID: 42}
-	b.nav(c, "hello", [][]string{{"a", "noop"}})
-	b.nav(c, "world", [][]string{{"b", "noop"}})
+	c := chat{ID: 1}
 	b.sendMain(c, "")
+	
+	menu := b.replyMainMenuFor(1, 5)
+	if len(menu) == 0 {
+		t.Fatal("main menu must not be empty")
+	}
+	if !strings.Contains(menu[0][0], "شروع اسکن (5 کانفیگ)") {
+		t.Fatalf("first button should be start scan with count, got %s", menu[0][0])
+	}
+
+	sMenu := b.replySettingsMenu()
+	if len(sMenu) == 0 {
+		t.Fatal("settings menu must not be empty")
+	}
 	var _ sync.Mutex
+}
+
+func TestMessageForUsersPersists(t *testing.T) {
+	dir := t.TempDir()
+	b := NewBot("token", 1, dir, "xray", "hysteria")
+	c := chat{ID: 1}
+	customMsg := "🎯 Made by @wpnfa\nT.me/wpnfa"
+	b.onSetMessageForUsers(c, customMsg)
+
+	b2 := NewBot("token", 1, dir, "xray", "hysteria")
+	s := b2.settingsLocked()
+	if s.MessageForUsers != customMsg {
+		t.Fatalf("expected message %q, got %q", customMsg, s.MessageForUsers)
+	}
+
+	b2.onClearMessageForUsers(c)
+	s2 := b2.settingsLocked()
+	if s2.MessageForUsers != "" {
+		t.Fatalf("expected empty message, got %q", s2.MessageForUsers)
+	}
 }
 
 // Regression (v1.0.8): outputs were measured in BYTES, but Telegram limits

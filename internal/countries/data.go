@@ -1,6 +1,9 @@
 package countries
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Generated from the app's CountryData.java (ISO 3166-1: code, English, Persian).
 type Country struct {
@@ -270,3 +273,14 @@ func Names(code, lang string) (string, bool) {
 
 // Known reports whether the ISO code exists in the table.
 func Known(code string) bool { _, ok := byCode[strings.ToUpper(code)]; return ok }
+
+// All returns every known country in a stable (code) order — used for
+// exporting emoji codes in the same order as the app.
+func All() []Country {
+	out := make([]Country, 0, len(byCode))
+	for _, c := range byCode {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Code < out[j].Code })
+	return out
+}

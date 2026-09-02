@@ -73,3 +73,42 @@ func TestParseBasics(t *testing.T) {
 func b64url(s string) string {
 	return base64.URLEncoding.EncodeToString([]byte(s))
 }
+
+// Configs pasted from HTML (web pages, other bots) arrive with &amp; — the
+// query string must still parse (regression: hy2 obfs password was lost).
+func TestParseHysteria2HTMLEntities(t *testing.T) {
+	line := "hysteria2://ae98r4oeasrsjpb5@0xdl6fcw.easyiran.org:35256?sni=0xdl6fcw.easyiran.org&amp;obfs=salamander&amp;obfs-password=4gv7x17ll5us41bl#Hy-23"
+	specs := ParseInput(line)
+	if len(specs) != 1 {
+		t.Fatalf("specs = %d, want 1", len(specs))
+	}
+	s := specs[0]
+	if s.Protocol != "hysteria2" {
+		t.Fatalf("protocol = %q", s.Protocol)
+	}
+	if s.SNI != "0xdl6fcw.easyiran.org" {
+		t.Fatalf("sni = %q", s.SNI)
+	}
+	if s.ExtraRaw != "salamander" {
+		t.Fatalf("obfs = %q, want salamander", s.ExtraRaw)
+	}
+	if s.Cipher != "4gv7x17ll5us41bl" {
+		t.Fatalf("obfs password = %q", s.Cipher)
+	}
+	if s.Port != 35256 {
+		t.Fatalf("port = %d", s.Port)
+	}
+}
+
+// A plain config without entities must parse identically (no double-unescape).
+func TestParseHysteria2Plain(t *testing.T) {
+	line := "hysteria2://user@host.example:443?sni=host.example&obfs=salamander&obfs-password=secret#n"
+	specs := ParseInput(line)
+	if len(specs) != 1 {
+		t.Fatalf("specs = %d, want 1", len(specs))
+	}
+	s := specs[0]
+	if s.ExtraRaw != "salamander" || s.Cipher != "secret" {
+		t.Fatalf("obfs=%q cipher=%q", s.ExtraRaw, s.Cipher)
+	}
+}

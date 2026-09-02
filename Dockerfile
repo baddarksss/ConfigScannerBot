@@ -19,11 +19,21 @@ RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERS
     && rm -rf /tmp/xray /tmp/xray.zip \
     && /usr/local/bin/xray version | head -1
 
+# native Hysteria client — Xray-core's salamander/gecko UDP obfs is broken
+# upstream, so every hy2 link is tested through this binary (app parity).
+# Same version line the app bundles (hy2 core v2.12.2).
+ARG HYSTERIA_VERSION=v2.12.2
+RUN curl -fsSL "https://github.com/HyNetworks/hysteria/releases/download/app/${HYSTERIA_VERSION}/hysteria-linux-amd64" \
+        -o /usr/local/bin/hysteria \
+    && chmod +x /usr/local/bin/hysteria \
+    && (/usr/local/bin/hysteria version | grep -i "Version:" || true)
+
 COPY --from=build /out/cfgscan-bot /usr/local/bin/cfgscan-bot
 
 # persistent settings: attach a Railway VOLUME at /data from the dashboard
 # (the Dockerfile VOLUME instruction is rejected by Railway builds)
 ENV DATA_DIR=/data
 ENV XRAY_BIN=/usr/local/bin/xray
+ENV HYSTERIA_BIN=/usr/local/bin/hysteria
 
 ENTRYPOINT ["/usr/local/bin/cfgscan-bot"]

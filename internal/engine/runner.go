@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"html"
 	"net"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 // Config holds the run options (mirrors the app's settings).
 type Config struct {
 	XrayBin        string
+	HysteriaBin    string // native hysteria client for hy2 (salamander/gecko)
 	WorkDir        string // temp dir for configs + engine logs
 	Parallel       int    // concurrent tests (default 4)
 	TimeoutSec     int    // per-server connect timeout (default 10)
@@ -30,6 +32,9 @@ type Config struct {
 func (c *Config) defaults() {
 	if c.XrayBin == "" {
 		c.XrayBin = "xray"
+	}
+	if c.HysteriaBin == "" {
+		c.HysteriaBin = "hysteria"
 	}
 	if c.WorkDir == "" {
 		c.WorkDir = os.TempDir()
@@ -77,10 +82,13 @@ func (r *RunResult) Summary(outLang string) string {
 }
 
 // ParseInput turns raw pasted text into server specs (skips blanks/comments).
+// HTML entities are unescaped first: configs pasted from web pages or other
+// bots often arrive with "&amp;" instead of "&", which silently mangles the
+// query string (e.g. the hy2 obfs password key becomes "amp;obfs-password").
 func ParseInput(text string) []*ServerSpec {
 	var out []*ServerSpec
 	for _, line := range strings.Split(text, "\n") {
-		t := strings.TrimSpace(line)
+		t := html.UnescapeString(strings.TrimSpace(line))
 		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
@@ -273,29 +281,35 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 			msg = "پروتکل " + s.Protocol + " توی هسته‌ی رسمی نیست"
 		}
 		return "⚠️ " + base + " — " + msg, kSkip
+	case "hysteria2":
+		// obfs type without a password cannot be tested at all (app parity)
+		obfsType := strings.ToLower(strings.TrimSpace(s.ExtraRaw))
+		if (obfsType == "salamander" || obfsType == "gecko") && s.Cipher == "" {
+			msg := "hysteria2 obfs without password"
+			if cfg.OutLang == "fa" {
+				msg = "obfs بدون رمز — قابل تست نیست"
+			}
+			return "⚠️ " + base + " — " + msg, kSkip
+		}
 	}
 
-	xrayLog := filepath.Join(cfg.WorkDir, "xrayw_"+itoa(port)+".log")
-	cfgStr, err := BuildFull(s, port, xrayLog)
-	if err != nil {
-		return "❌ " + base + " — " + err.Error(), kFail
-	}
-	cfgFile := filepath.Join(cfg.WorkDir, "cfg_"+itoa(port)+".json")
-	if err := os.WriteFile(cfgFile, []byte(cfgStr), 0o644); err != nil {
-		return "❌ " + base + " — " + err.Error(), kFail
-	}
-	defer os.Remove(cfgFile)
-	defer os.Remove(xrayLog)
-
-	// launch xray
-	cmd := exec.Command(cfg.XrayBin, "-c", cfgFile)
-	if err := cmd.Start(); err != nil {
-		return "❌ " + base + " — " + "engine start error", kFail
+	// Engine choice: Xray-core's salamander/gecko UDP obfs is broken upstream
+	// (its finalmask wrapper never sends or reads packets — verified by the
+	// app's packet capture; XTLS/Xray-core#5712 closed as not-planned), so
+	// every hysteria2 link runs through the native Hysteria client, exactly
+	// like the app. All other protocols use Xray.
+	cmd, engineLog, cfgFile := startEngineFor(s, cfg, port)
+	if cmd == nil {
+		return "❌ " + base + " — engine start error", kFail
 	}
 	defer func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 	}()
+	if cfgFile != "" {
+		defer os.Remove(cfgFile)
+	}
+	defer os.Remove(engineLog)
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -307,7 +321,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 	up := waitForPort(port, time.Duration(waitMs)*time.Millisecond)
 	if !up {
 		cfg.Logf(fmt.Sprintf("test: port %d not up after %dms log=%s",
-			port, waitMs, tailFile(xrayLog, 200)))
+			port, waitMs, tailFile(engineLog, 200)))
 		return "❌ " + base + " — " + failMsg(cfg.OutLang, "connect"), kFail
 	}
 	cfg.Logf(fmt.Sprintf("test: port %d up", port))
@@ -444,6 +458,88 @@ func tailFile(path string, maxBytes int) string {
 }
 
 // Flag: ISO 3166-1 alpha-2 -> flag emoji (same as GeoChecker.flag).
+// startEngineFor launches the right core for this server. It returns the
+// process, the engine log path and the written config file ("" for engines
+// that need none). A nil process means the engine could not be started.
+func startEngineFor(s *ServerSpec, cfg Config, port int) (*exec.Cmd, string, string) {
+	if s.Protocol == "hysteria2" {
+		return startHysteria(s, cfg, port)
+	}
+	engineLog := filepath.Join(cfg.WorkDir, "xrayw_"+itoa(port)+".log")
+	cfgStr, err := BuildFull(s, port, engineLog)
+	if err != nil {
+		cfg.Logf("test: build config error: " + err.Error())
+		return nil, "", ""
+	}
+	cfgFile := filepath.Join(cfg.WorkDir, "cfg_"+itoa(port)+".json")
+	if err := os.WriteFile(cfgFile, []byte(cfgStr), 0o644); err != nil {
+		cfg.Logf("test: write config error: " + err.Error())
+		return nil, "", ""
+	}
+	cmd := exec.Command(cfg.XrayBin, "-c", cfgFile)
+	if err := cmd.Start(); err != nil {
+		cfg.Logf("test: xray start error: " + err.Error())
+		return nil, "", ""
+	}
+	return cmd, engineLog, cfgFile
+}
+
+// startHysteria mirrors the app's HysteriaManager: a YAML client config with
+// a local SOCKS5 listener, launched via the native hysteria binary.
+func startHysteria(s *ServerSpec, cfg Config, port int) (*exec.Cmd, string, string) {
+	engineLog := filepath.Join(cfg.WorkDir, "hy2w_"+itoa(port)+".log")
+	var y strings.Builder
+	y.WriteString("server: " + s.hostport() + "\n")
+	y.WriteString("auth: " + yamlQuote(s.Password) + "\n")
+	y.WriteString("tls:\n")
+	sni := s.SNI
+	if sni == "" {
+		sni = s.Host
+	}
+	y.WriteString("  sni: " + yamlQuote(sni) + "\n")
+	if s.AllowInsecure {
+		y.WriteString("  insecure: true\n")
+	}
+	obfsType := strings.ToLower(strings.TrimSpace(s.ExtraRaw))
+	if obfsType == "salamander" || obfsType == "gecko" {
+		if s.Cipher == "" {
+			cfg.Logf("test: hy2 obfs without password")
+			return nil, "", ""
+		}
+		y.WriteString("obfs:\n")
+		y.WriteString("  type: " + obfsType + "\n")
+		y.WriteString("  " + obfsType + ":\n")
+		y.WriteString("    password: " + yamlQuote(s.Cipher) + "\n")
+	}
+	y.WriteString("socks5:\n")
+	fmt.Fprintf(&y, "  listen: 127.0.0.1:%d\n", port)
+	cfgFile := filepath.Join(cfg.WorkDir, "hy2_"+itoa(port)+".yaml")
+	if err := os.WriteFile(cfgFile, []byte(y.String()), 0o644); err != nil {
+		cfg.Logf("test: hy2 write config error: " + err.Error())
+		return nil, "", ""
+	}
+	logF, err := os.OpenFile(engineLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		cfg.Logf("test: hy2 open log error: " + err.Error())
+		return nil, "", ""
+	}
+	cmd := exec.Command(cfg.HysteriaBin, "client", "-c", cfgFile, "-l", "debug")
+	cmd.Stdout = logF
+	cmd.Stderr = logF
+	if err := cmd.Start(); err != nil {
+		logF.Close()
+		cfg.Logf("test: hysteria start error: " + err.Error())
+		return nil, "", ""
+	}
+	// the child keeps the log open; closing our handle is fine
+	_ = logF.Close()
+	return cmd, engineLog, cfgFile
+}
+
+func yamlQuote(v string) string {
+	return "\"" + strings.ReplaceAll(strings.ReplaceAll(v, `\`, `\\`), `"`, `\"`) + "\""
+}
+
 func Flag(code string) string {
 	if len(code) != 2 {
 		return "🏳️"

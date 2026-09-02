@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.8"
+	BotVersion = "1.0.9"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -991,14 +991,13 @@ func (b *Bot) onAbout(c chat) {
 	}
 	b.nav(c,
 		"ℹ️ <b>ConfigScanner Bot</b> <code>v"+BotVersion+"</code>\n\n"+
-			"• 📡 هر سرور با یک پروسس xray جدا و پورت اختصاصی تست می‌شه\n"+
+			"• 📡 هر سرور با یک پروسس xray جدا و تخصیص اتمیک پورت تست می‌شه\n"+
 			"• 💨 hy2 (سالمندر/جکوهو) با هسته‌ی اصلی hysteria — دقیقاً مثل اپ\n"+
 			"• 🔒 لینک‌های <code>insecure=1</code> با پین کردن گواهی تست می‌شن (مثل اپ)\n"+
-			"• 💀 پروب «تونل مرده» قبل از جیو (ریست فوری = غیرقابل دسترس)\n"+
-			"• 🌐 ۶ سرویس جیو در موج‌های موازی + رأی‌گیری (۲ رأی = مطمئن)\n"+
+			"• 🧩 پشتیبانی کامل از TCP Fragment و تنظیمات پیشرفته ECH\n"+
+			"• 🌐 ۶ سرویس جیو به‌صورت کاملاً موازی + رأی‌گیری سریع\n"+
 			"• 📉 fallback HTTP ساده (ip-api) برای خروجی‌هایی که TLS رو می‌بندن\n"+
-			"• ⏳ تلاش نهایی ۲۰ ثانیه‌ای برای خروجی‌های کند (فقط timeout)\n"+
-			"• 🏷️ اسم یکتا برای هر خروجی (dedup پنل‌ها چیزی حذف نمی‌کنه)\n"+
+			"• 🏷️ اسم یکتا برای هر خروجی بدون شماره‌های اضافی\n"+
 			"• 🎨 کپشن با custom emoji + ورودی/خروجی کدها با اپ\n\n"+
 			"⚙️ فعلی: "+itoaSafe(s.Parallel)+" همزمان · "+itoaSafe(s.TimeoutSec)+" ثانیه · "+langName+
 			"\n\n⚠️ نکته: نتیجه‌ها از دید IP سرور (Railway) هستن؛ بعضی سرورها دیتاسنتر رو فیلتر می‌کنن و از ایران سالم‌ان.",

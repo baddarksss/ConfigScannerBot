@@ -9,10 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"cfgscanbot/internal/countries"
@@ -26,7 +24,6 @@ type GeoResult struct {
 	IP         string
 	Votes      int
 	Answered   int
-	DeadTunnel bool
 	SingleVote bool
 }
 
@@ -49,150 +46,81 @@ var services = []service{
 	{"http://ip-api.com/json/", "country", "countryCode", ""},
 }
 
-type failStats struct {
-	timeouts int32
-	resets   int32
-}
-
-func (f *failStats) addTimeout() { atomic.AddInt32(&f.timeouts, 1) }
-func (f *failStats) addReset()   { atomic.AddInt32(&f.resets, 1) }
-
 type vote struct {
 	code    string
 	country string
 	ip      string
 }
 
-func (v vote) valid() bool { return v != (vote{}) && v.code != "" }
+func (v vote) valid() bool { return v.code != "" }
 
-// Check detects the exit country of a local SOCKS5 proxy. Logic is
-// identical to the app: lone-request probe (dead-tunnel detection),
-// parallel waves with cooldowns, plurality vote, and a final slow retry
-// when every attempt timed out.
+// Check detects the exit country of a local SOCKS5 proxy via parallel queries.
 func Check(ctx context.Context, proxyPort, connectTimeoutSec int, logf func(string)) *GeoResult {
-	budget := connectTimeoutSec
-	if budget < 30 {
-		budget = 30
+	if connectTimeoutSec < 5 {
+		connectTimeoutSec = 5
 	}
-	if budget > 40 {
-		budget = 40
-	}
-	deadline, cancel := context.WithDeadline(ctx, time.Now().Add(time.Duration(budget)*time.Second))
+	deadline, cancel := context.WithTimeout(ctx, time.Duration(connectTimeoutSec)*time.Second)
 	defer cancel()
 
-	var votes []vote
-	stats := &failStats{}
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	client := geoClient(proxyAddr, connectTimeoutSec, connectTimeoutSec)
 
-	// probe: an exit that resets single requests will not carry the bursts
-	pk, pv := probeTunnel(deadline, proxyAddr, connectTimeoutSec, stats, logf)
-	if pk == pDead {
-		return &GeoResult{DeadTunnel: true}
-	}
-	if pv != nil && pv.valid() {
-		votes = append(votes, *pv)
-	}
+	var (
+		mu       sync.Mutex
+		votes    []vote
+		voteChan = make(chan vote, len(services))
+		done     = make(chan struct{})
+		wg       sync.WaitGroup
+	)
 
-	wave1 := []int{4, 2} // cloudflare, ip.sb
-	wave2 := []int{0, 3, 1, 5}
-	wave3 := []int{4}
-	wave4 := []int{2}
-	wave5 := []int{5}
-
-	collectWave(deadline, wave1, proxyPort, connectTimeoutSec, &votes, stats, logf)
-	if topVote(votes) >= 2 {
-		return makeResult(votes)
-	}
-	cooldown(deadline)
-	collectWave(deadline, wave2, proxyPort, connectTimeoutSec, &votes, stats, logf)
-	if topVote(votes) >= 2 {
-		return makeResult(votes)
-	}
-	cooldown(deadline)
-	collectWave(deadline, wave3, proxyPort, connectTimeoutSec, &votes, stats, logf)
-	if topVote(votes) >= 2 {
-		return makeResult(votes)
-	}
-	cooldown(deadline)
-	collectWave(deadline, wave4, proxyPort, connectTimeoutSec, &votes, stats, logf)
-	if topVote(votes) >= 2 {
-		return makeResult(votes)
-	}
-	cooldown(deadline)
-	collectWave(deadline, wave5, proxyPort, connectTimeoutSec, &votes, stats, logf)
-	r := makeResult(votes)
-
-	if !r.OK && atomic.LoadInt32(&stats.timeouts) > 0 && atomic.LoadInt32(&stats.resets) == 0 {
-		// everything timed out, nothing reset: slow exit — one last longer
-		// lone request before calling it unknown
-		proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-		if v := slowRetry(proxyAddr, stats, logf); v.valid() {
-			votes = append(votes, v)
-			r = makeResult(votes)
-		}
-	}
-	return r
-}
-
-func cooldown(deadline context.Context) {
-	d, _ := deadline.Deadline()
-	left := time.Until(d) - 1200*time.Millisecond
-	if left <= 0 {
-		return
-	}
-	if left > time.Second {
-		left = time.Second
-	}
-	select {
-	case <-time.After(left):
-	case <-deadline.Done():
-	}
-}
-
-type probeKind int
-
-const (
-	pOK probeKind = iota
-	pSlow
-	pDead
-)
-
-type probeOutcome int
-
-const (
-	poAnswer probeOutcome = iota
-	poTimeout
-	poReset
-	poNon200
-)
-
-// probeTunnel mirrors the app: a TIMEOUT at any attempt means "slow exit"
-// (the waves get the chance); only three consecutive RESETS mean dead.
-func probeTunnel(ctx context.Context, proxyAddr string, connectTimeoutSec int,
-	stats *failStats, logf func(string)) (probeKind, *vote) {
-	attempts := []struct {
-		idx   int
-		parse codeParser
-		tag   string
-	}{
-		{4, traceParse, "probe"},
-		{2, jsonCodeParse("country_code"), "probe2"},
-		{5, jsonCodeParse("countryCode"), "probe3"},
-	}
-	for i, a := range attempts {
-		out, code := probeOnce(ctx, proxyAddr, connectTimeoutSec, services[a.idx], a.parse, stats, a.tag, logf)
-		switch out {
-		case poAnswer:
-			return pOK, countryVote(code)
-		case poTimeout, poNon200:
-			return pSlow, nil
-		case poReset:
-			if logf != nil {
-				logf(fmt.Sprintf("geo: %s reset (attempt %d)", a.tag, i+1))
+	for _, svc := range services {
+		wg.Add(1)
+		go func(s service) {
+			defer wg.Done()
+			v, ok := doQuery(deadline, client, s, logf)
+			if ok && v.valid() {
+				select {
+				case voteChan <- v:
+				case <-deadline.Done():
+				}
 			}
+		}(svc)
+	}
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	for {
+		select {
+		case <-deadline.Done():
+			mu.Lock()
+			r := makeResult(votes)
+			mu.Unlock()
+			return r
+		case <-done:
+			for {
+				select {
+				case v := <-voteChan:
+					if v.valid() {
+						votes = append(votes, v)
+					}
+				default:
+					return makeResult(votes)
+				}
+			}
+		case v := <-voteChan:
+			mu.Lock()
+			votes = append(votes, v)
+			if topVote(votes) >= 2 {
+				r := makeResult(votes)
+				mu.Unlock()
+				return r
+			}
+			mu.Unlock()
 		}
 	}
-	return pDead, nil
 }
 
 type codeParser func(body string) string
@@ -209,121 +137,13 @@ func traceParse(body string) string {
 	return ""
 }
 
-func jsonCodeParse(field string) codeParser {
-	return func(body string) string {
-		var m map[string]any
-		if err := json.Unmarshal([]byte(body), &m); err != nil {
-			return ""
-		}
-		if s, ok := m[field].(string); ok {
-			s = strings.ToUpper(s)
-			if len(s) == 2 {
-				return s
-			}
-		}
-		return ""
-	}
-}
-
-// probeOnce issues one request and classifies the outcome.
-func probeOnce(ctx context.Context, proxyAddr string, connectTimeoutSec int,
-	svc service, parse codeParser, stats *failStats, tag string, logf func(string)) (probeOutcome, string) {
-	client := geoClient(proxyAddr, connectTimeoutSec, 12)
-	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, svc.url, nil)
+func doQuery(ctx context.Context, client *http.Client, svc service, logf func(string)) (vote, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, svc.url, nil)
 	if err != nil {
-		stats.addReset()
-		return poReset, ""
+		return vote{}, false
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		if isTimeout(err) {
-			stats.addTimeout()
-			return poTimeout, ""
-		}
-		stats.addReset()
-		return poReset, ""
-	}
-	defer resp.Body.Close()
-	if !respOK(resp) {
-		return poNon200, ""
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if code := parse(string(body)); code != "" {
-		return poAnswer, code
-	}
-	return poNon200, ""
-}
-
-// slowRetry runs AFTER the geo budget is exhausted, so it uses its own
-// deadlines (the run-level ctx is already spent).
-func slowRetry(proxyAddr string, stats *failStats, logf func(string)) vote {
-	client := geoClientLong(proxyAddr)
-	for i, idx := range []int{4, 2} {
-		reqCtx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
-		v, ok := doQuery(reqCtx, client, services[idx], stats, logf)
-		cancel()
-		if ok {
-			if logf != nil {
-				logf("geo: slow retry -> " + v.code)
-			}
-			return v
-		}
-		if i == 0 {
-			// continue to the second service
-		}
-	}
-	if logf != nil {
-		logf("geo: slow retry: no answer")
-	}
-	return vote{}
-}
-
-func collectWave(deadline context.Context, wave []int, proxyPort, connectTimeoutSec int,
-	votes *[]vote, stats *failStats, logf func(string)) {
-	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	var wg sync.WaitGroup
-	ch := make(chan vote, len(wave))
-	for _, idx := range wave {
-		wg.Add(1)
-		go func(svc service) {
-			defer wg.Done()
-			client := geoClient(proxyAddr, connectTimeoutSec, 12)
-			v, _ := doQuery(deadline, client, svc, stats, logf)
-			ch <- v
-		}(services[idx])
-	}
-	go func() { wg.Wait(); close(ch) }()
-	for {
-		select {
-		case <-deadline.Done():
-			return
-		case v, ok := <-ch:
-			if !ok {
-				return
-			}
-			if v.valid() {
-				*votes = append(*votes, v)
-			}
-		}
-	}
-}
-
-func doQuery(ctx context.Context, client *http.Client, svc service,
-	stats *failStats, logf func(string)) (vote, bool) {
-	u, err := url.Parse(svc.url)
-	if err != nil {
-		stats.addReset()
-		return vote{}, false
-	}
-	resp, err := client.Do(&http.Request{Method: http.MethodGet, URL: u, Host: u.Host})
-	if err != nil {
-		if isTimeout(err) {
-			stats.addTimeout()
-		} else {
-			stats.addReset()
-		}
 		if logf != nil {
 			logf("geo: " + svc.url + " failed: " + errName(err))
 		}
@@ -336,7 +156,10 @@ func doQuery(ctx context.Context, client *http.Client, svc service,
 		}
 		return vote{}, false
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return vote{}, false
+	}
 	text := string(body)
 	if svc.countryF == "@@trace" {
 		code := traceParse(text)
@@ -371,8 +194,7 @@ func doQuery(ctx context.Context, client *http.Client, svc service,
 		return vote{}, false
 	}
 	if code == "" && country != "" {
-		// name-only answer: try to reverse-map is overkill; vote on the name hash
-		return vote{code: countryTag(country)}, true
+		return vote{code: countryTag(country), country: country}, true
 	}
 	if country == "" {
 		if n, ok := countries.Names(code, "en"); ok {
@@ -389,7 +211,6 @@ func doQuery(ctx context.Context, client *http.Client, svc service,
 	return vote{code: code, country: country, ip: ip}, true
 }
 
-// countryTag gives a deterministic 2-letter-ish bucket for name-only answers.
 func countryTag(name string) string {
 	name = strings.ToUpper(strings.TrimSpace(name))
 	if len(name) >= 2 {
@@ -451,11 +272,6 @@ func makeResult(votes []vote) *GeoResult {
 	return r
 }
 
-func countryVote(code string) *vote {
-	name, _ := countries.Names(code, "en")
-	return &vote{code: code, country: name}
-}
-
 // ------------------------------------------------------------------
 // minimal SOCKS5 dialer (stdlib only) + http clients
 
@@ -514,8 +330,18 @@ func socks5Dial(ctx context.Context, proxyAddr, target string) (net.Conn, error)
 		c.Close()
 		return nil, fmt.Errorf("socks5: method rejected")
 	}
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
-	req = append(req, host...)
+
+	var req []byte
+	if ip4 := net.ParseIP(host).To4(); ip4 != nil {
+		req = []byte{0x05, 0x01, 0x00, 0x01}
+		req = append(req, ip4...)
+	} else if ip6 := net.ParseIP(host).To16(); ip6 != nil && strings.Contains(host, ":") {
+		req = []byte{0x05, 0x01, 0x00, 0x04}
+		req = append(req, ip6...)
+	} else {
+		req = []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
+		req = append(req, host...)
+	}
 	req = append(req, byte(port>>8), byte(port&0xff))
 	if _, err := c.Write(req); err != nil {
 		c.Close()
@@ -575,18 +401,9 @@ func geoClient(proxyAddr string, connectTimeoutSec, readTimeoutSec int) *http.Cl
 			return tc, nil
 		},
 		ForceAttemptHTTP2:     true,
-		TLSHandshakeTimeout:   15 * time.Second,
+		TLSHandshakeTimeout:   time.Duration(connectTimeoutSec) * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	timeout := time.Duration(connectTimeoutSec+readTimeoutSec) * time.Second
-	if timeout < 20*time.Second {
-		timeout = 20 * time.Second
-	}
 	return &http.Client{Transport: tr, Timeout: timeout}
 }
-
-func geoClientLong(proxyAddr string) *http.Client {
-	return geoClient(proxyAddr, 8, 20)
-}
-
-

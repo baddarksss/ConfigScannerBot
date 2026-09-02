@@ -132,17 +132,18 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 	var (
 		mu        sync.Mutex
 		doneCount int
+		okLinks   []string
+		unkLinks  []string
 		portSet   = map[int]bool{}
 		portBase  = 21000 + int(time.Now().UnixNano()%500)
 	)
 
 	nextPort := func() int {
-		for i := 0; i < 400; i++ {
-			port := (portBase + i)%60000 + 1024
-			mu.Lock()
-			taken := portSet[port]
-			mu.Unlock()
-			if taken {
+		mu.Lock()
+		defer mu.Unlock()
+		for i := 0; i < 20000; i++ {
+			port := (portBase+i)%60000 + 1024
+			if portSet[port] {
 				continue
 			}
 			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -150,12 +151,18 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 				continue
 			}
 			ln.Close()
-			mu.Lock()
 			portSet[port] = true
-			mu.Unlock()
 			return port
 		}
-		return portBase + 900
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err == nil {
+			addr := ln.Addr().(*net.TCPAddr)
+			port := addr.Port
+			ln.Close()
+			portSet[port] = true
+			return port
+		}
+		return 25000
 	}
 	releasePort := func(port int) {
 		mu.Lock()
@@ -180,8 +187,10 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 			switch kind {
 			case kOK:
 				res.OK++
+				okLinks = append(okLinks, line)
 			case kPartial:
 				res.NoCountry++
+				unkLinks = append(unkLinks, line)
 			case kFail:
 				res.Unreachable++
 			case kSkip:
@@ -207,21 +216,12 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 
 	mu.Lock()
 	res.Lines = append(res.Lines, "", "—— "+res.Summary(e.cfg.OutLang)+" ——")
-	res.Links = make([]string, 0, len(res.Lines))
-	for _, l := range res.Lines {
-		t := strings.TrimSpace(l)
-		if isLink(t) {
-			res.Links = append(res.Links, t)
-		}
-	}
+	res.UnknownLinks = unkLinks
+	res.Links = make([]string, 0, len(okLinks)+len(unkLinks))
+	res.Links = append(res.Links, okLinks...)
 	if e.cfg.IncludeUnknown {
-		for _, u := range res.UnknownLinks {
-			if !contains(res.Links, u) {
-				res.Links = append(res.Links, u)
-			}
-		}
+		res.Links = append(res.Links, unkLinks...)
 	}
-	res.UnknownLinks = e.unknown
 	res.CountryCodes = e.codes
 	res.Flags = e.flags
 	mu.Unlock()
@@ -345,17 +345,12 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 	}
 	cfg.Logf(fmt.Sprintf("test: port %d up", port))
 
-	// geo check (30-40s budget inside, like the app)
+	// geo check
 	t0 := time.Now()
 	geo := Check(context.Background(), port, cfg.TimeoutSec, cfg.Logf)
 	took := time.Since(t0) / time.Second
 	cfg.Logf(fmt.Sprintf("test: geo code=%s country=%s ip=%s ok=%v votes=%d took=%ds",
 		geo.Code, geo.Country, geo.IP, geo.OK, geo.Votes, took))
-
-	if geo.DeadTunnel {
-		cfg.Logf("test: tunnel up but traffic does not pass — " + hostport)
-		return "❌ " + base + " — " + failMsg(cfg.OutLang, "dead"), kFail
-	}
 
 	if geo.OK && geo.Code != "" {
 		countryName := geo.Country
@@ -437,15 +432,11 @@ func failMsg(lang, kind string) string {
 		switch kind {
 		case "connect":
 			return "اتصال برقرار نشد"
-		case "dead":
-			return "وصل شد ولی خروجی ترافیک رو رد نمی‌کنه"
 		}
 	}
 	switch kind {
 	case "connect":
 		return "connection failed"
-	case "dead":
-		return "tunnel up but traffic does not pass"
 	}
 	return "failed"
 }

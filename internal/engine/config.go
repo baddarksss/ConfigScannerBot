@@ -51,15 +51,30 @@ func BuildFull(s *ServerSpec, port int, logPath string) (string, error) {
 			},
 		}
 	}
-	outs = append(outs, outMap, map[string]any{"protocol": "blackhole", "tag": "block"})
+	outs = append(outs, outMap)
 	if fragOut != nil {
 		outs = append(outs, fragOut)
 	}
+	outs = append(outs, map[string]any{"protocol": "blackhole", "tag": "block"})
+
 	cfg := map[string]any{
 		"log":       log,
 		"inbounds":  []any{in},
 		"outbounds": outs,
 	}
+
+	if echRes := GetEchDnsResolver(s.ECH); echRes != "" {
+		cfg["dns"] = map[string]any{
+			"servers": []any{
+				echRes,
+				"https://1.1.1.1/dns-query",
+				"8.8.8.8",
+				"1.1.1.1",
+				"localhost",
+			},
+		}
+	}
+
 	b, err := json.Marshal(cfg)
 	return string(b), err
 }
@@ -223,6 +238,11 @@ func buildStreamSettings(s *ServerSpec) (map[string]any, error) {
 		// "half" = resolve the ECH config itself when advertised
 		if s.ECH != "" {
 			t["echForceQuery"] = "half"
+			if len(s.ECH) > 25 && !strings.Contains(s.ECH, "/") &&
+				!strings.Contains(s.ECH, "+") && !strings.Contains(s.ECH, ":") &&
+				!strings.Contains(s.ECH, "?") {
+				t["echConfig"] = s.ECH
+			}
 		}
 		// self-signed / insecure=1: pin the leaf cert fetched at test start
 		if s.PinnedCert != "" {
@@ -285,48 +305,83 @@ func buildStreamSettings(s *ServerSpec) (map[string]any, error) {
 // FragmentSettings parses the panel ?fm= JSON into xray freedom fragment
 // settings, or nil when nothing usable.
 func FragmentSettings(raw string) map[string]any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
 	var fm map[string]any
 	if err := json.Unmarshal([]byte(raw), &fm); err != nil {
 		return nil
 	}
-	arr, ok := fm["tcp"].([]any)
-	if !ok {
-		return nil
-	}
-	for _, e := range arr {
-		obj, ok := e.(map[string]any)
-		if !ok {
-			continue
+	if arr, ok := fm["tcp"].([]any); ok {
+		for _, e := range arr {
+			obj, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if obj["type"] != "fragment" {
+				continue
+			}
+			set, _ := obj["settings"].(map[string]any)
+			if set == nil {
+				continue
+			}
+			return map[string]any{
+				"packets":  strOr(set["packets"], "tlshello"),
+				"length":   fragRange(set["lengths"], "50-100"),
+				"interval": fragRange(set["delays"], "10-20"),
+			}
 		}
-		if obj["type"] != "fragment" {
-			continue
+	} else if fm["packets"] != nil || fm["lengths"] != nil || fm["length"] != nil {
+		lenVal := fm["lengths"]
+		if lenVal == nil {
+			lenVal = fm["length"]
 		}
-		set, _ := obj["settings"].(map[string]any)
-		if set == nil {
-			continue
+		delVal := fm["delays"]
+		if delVal == nil {
+			delVal = fm["interval"]
 		}
 		return map[string]any{
-			"packets":  strOr(set["packets"], "tlshello"),
-			"length":   fragRange(set["lengths"], "50-100"),
-			"interval": fragRange(set["delays"], "10-20"),
+			"packets":  strOr(fm["packets"], "tlshello"),
+			"length":   fragRange(lenVal, "50-100"),
+			"interval": fragRange(delVal, "10-20"),
 		}
 	}
 	return nil
 }
 
 func fragRange(v any, dflt string) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
 	arr, ok := v.([]any)
-	if !ok {
+	if !ok || len(arr) == 0 {
 		return dflt
 	}
 	if len(arr) >= 2 {
-		return utoa(toInt(arr[0])) + "-" + utoa(toInt(arr[1]))
+		return strVal(arr[0]) + "-" + strVal(arr[1])
 	}
 	if len(arr) == 1 {
-		n := utoa(toInt(arr[0]))
-		return n + "-" + n
+		s := strVal(arr[0])
+		if strings.Contains(s, "-") {
+			return s
+		}
+		return s + "-" + s
 	}
 	return dflt
+}
+
+func strVal(v any) string {
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	if f, ok := v.(float64); ok {
+		return utoa(int(f))
+	}
+	if n, ok := v.(int); ok {
+		return utoa(n)
+	}
+	return strings.TrimSpace(utoa(toInt(v)))
 }
 
 func toInt(v any) int {

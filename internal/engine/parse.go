@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/base64"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -316,6 +317,9 @@ func parseVmess(line string) *ServerSpec {
 	}
 	s.SNI = jsonStrField(jsonStr, "sni")
 	s.Fingerprint = firstNonEmpty(jsonStrField(jsonStr, "fp"), "chrome")
+	s.ALPN = firstNonEmpty(jsonStrField(jsonStr, "alpn"), jsonStrField(jsonStr, "alpns"))
+	s.FragmentRaw = firstNonEmpty(jsonStrField(jsonStr, "fm"), jsonStrField(jsonStr, "fragment"))
+	s.ECH = jsonStrField(jsonStr, "ech")
 	s.Path = jsonStrField(jsonStr, "path")
 	s.HostHeader = jsonStrField(jsonStr, "host")
 	s.Flow = jsonStrField(jsonStr, "flow")
@@ -356,6 +360,7 @@ func parseTrojan(line string) *ServerSpec {
 	}
 	s.Security = firstNonEmpty(q["security"], "tls")
 	s.SNI = firstNonEmpty(q["sni"], q["servername"])
+	s.ALPN = q["alpn"]
 	s.FragmentRaw = firstNonEmpty(q["fm"], q["fragment"])
 	s.ECH = q["ech"]
 	s.Fingerprint = firstNonEmpty(q["fp"], "chrome")
@@ -657,4 +662,30 @@ func atoiOK(s string) (int, bool) {
 		n = n*10 + int(ch-'0')
 	}
 	return n, true
+}
+
+// GetEchDnsResolver extracts a DNS resolver URL/IP if specified in ech parameter (e.g. ip.gs+udp://8.8.8.8)
+func GetEchDnsResolver(ech string) string {
+	if ech == "" {
+		return ""
+	}
+	target := ech
+	if plus := strings.Index(ech, "+"); plus >= 0 {
+		target = strings.TrimSpace(ech[plus+1:])
+	}
+	if strings.HasPrefix(target, "udp://") || strings.HasPrefix(target, "https://") ||
+		strings.HasPrefix(target, "tcp://") || strings.HasPrefix(target, "quic://") {
+		return target
+	}
+	host := target
+	if h, _, err := net.SplitHostPort(target); err == nil {
+		host = h
+	}
+	if net.ParseIP(host) != nil {
+		if !strings.Contains(target, ":") {
+			target += ":53"
+		}
+		return "udp://" + target
+	}
+	return ""
 }

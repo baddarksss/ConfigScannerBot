@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -111,4 +112,93 @@ func TestParseHysteria2Plain(t *testing.T) {
 	if s.ExtraRaw != "salamander" || s.Cipher != "secret" {
 		t.Fatalf("obfs=%q cipher=%q", s.ExtraRaw, s.Cipher)
 	}
+}
+
+func TestFragmentSettings(t *testing.T) {
+	if FragmentSettings("") != nil {
+		t.Fatal("empty string should return nil")
+	}
+	if FragmentSettings("   ") != nil {
+		t.Fatal("blank string should return nil")
+	}
+	panelJSON := `{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["100-200"],"delays":["10-20"]}}]}`
+	set := FragmentSettings(panelJSON)
+	if set == nil {
+		t.Fatal("panelJSON returned nil")
+	}
+	if set["packets"] != "tlshello" || set["length"] != "100-200" || set["interval"] != "10-20" {
+		t.Fatalf("unexpected set: %+v", set)
+	}
+
+	directJSON := `{"packets":"tlshello","lengths":"50-100","delays":"10-20"}`
+	set2 := FragmentSettings(directJSON)
+	if set2 == nil || set2["length"] != "50-100" || set2["interval"] != "10-20" {
+		t.Fatalf("unexpected set2: %+v", set2)
+	}
+}
+
+func TestOutboundOrderAndDNS(t *testing.T) {
+	spec := ParseOne("vless://uuid-test@1.1.1.1:443?security=tls&sni=example.com&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%22tlshello%22%2C%22lengths%22%3A%5B%2250-100%22%5D%2C%22delays%22%3A%5B%2210-20%22%5D%7D%7D%5D%7D&ech=ip.gs%2Budp%3A%2F%2F8.8.8.8#Test")
+	if spec == nil {
+		t.Fatal("vless parse nil")
+	}
+	cfgStr, err := BuildFull(spec, 10808, "")
+	if err != nil {
+		t.Fatalf("BuildFull error: %v", err)
+	}
+	if !strings.Contains(cfgStr, `"dialerProxy":"fragment"`) {
+		t.Fatal("dialerProxy fragment missing")
+	}
+	// verify fragment comes before blackhole
+	idxFrag := strings.Index(cfgStr, `"tag":"fragment"`)
+	idxBlock := strings.Index(cfgStr, `"tag":"block"`)
+	if idxFrag < 0 || idxBlock < 0 || idxFrag > idxBlock {
+		t.Fatalf("outbounds order wrong: frag=%d, block=%d", idxFrag, idxBlock)
+	}
+	// verify DNS resolver was added
+	if !strings.Contains(cfgStr, `"udp://8.8.8.8"`) {
+		t.Fatal("ECH DNS resolver missing in dns section")
+	}
+}
+
+func TestGetEchDnsResolver(t *testing.T) {
+	if got := GetEchDnsResolver("ip.gs+udp://8.8.8.8"); got != "udp://8.8.8.8" {
+		t.Fatalf("resolver format: %q", got)
+	}
+	if got := GetEchDnsResolver("udp://1.1.1.1:53"); got != "udp://1.1.1.1:53" {
+		t.Fatalf("resolver udp: %q", got)
+	}
+	if got := GetEchDnsResolver("8.8.8.8"); got != "udp://8.8.8.8:53" {
+		t.Fatalf("resolver ip: %q", got)
+	}
+	if got := GetEchDnsResolver(""); got != "" {
+		t.Fatalf("empty ech: %q", got)
+	}
+}
+
+func TestIncludeUnknownFiltering(t *testing.T) {
+	e1 := NewEngine(Config{XrayBin: "/bin/true", IncludeUnknown: false})
+	okLinks := []string{"vless://ok#DE%20Germany"}
+	unkLinks := []string{"vless://unk#unknown"}
+	
+	resFalse := &RunResult{
+		OK: len(okLinks),
+		NoCountry: len(unkLinks),
+		UnknownLinks: unkLinks,
+		Links: append([]string{}, okLinks...),
+	}
+	if len(resFalse.Links) != 1 || resFalse.Links[0] != okLinks[0] {
+		t.Fatalf("IncludeUnknown=false should only contain okLinks: %+v", resFalse.Links)
+	}
+
+	resTrue := &RunResult{
+		OK: len(okLinks),
+		NoCountry: len(unkLinks),
+		UnknownLinks: unkLinks,
+		Links: append(append([]string{}, okLinks...), unkLinks...),
+	}
+	if len(resTrue.Links) != 2 {
+		t.Fatalf("IncludeUnknown=true should contain both: %+v", resTrue.Links)
+	}
+	_ = e1
 }

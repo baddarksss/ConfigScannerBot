@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.11"
+	BotVersion = "1.0.12"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -439,7 +439,7 @@ func (b *Bot) startRun(c chat) {
 		for _, iso := range res.CountryCodes {
 			flagList = append(flagList, engine.Flag(iso))
 		}
-		flagsText := strings.Join(flagList, "  ")
+		flagsText := strings.Join(flagList, " ")
 		_, _ = b.api.sendMessage(chatID, "<code>"+flagsText+"</code>")
 	}
 

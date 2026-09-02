@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.10"
+	BotVersion = "1.0.11"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -404,46 +404,59 @@ func (b *Bot) startRun(c chat) {
 			"✅ <b>اسکن تمام شد</b>\n\n%s", res.Summary(cfg.OutLang)))
 	}
 
-	// 1) Working links only (clean output)
+	// 1) Summary Table / Box (Clean Modern Table Layout in blockquote)
+	summaryMsg := fmt.Sprintf(
+		"<blockquote>\n"+
+			"📊 <b>گزارش نتیجه اسکن</b>\n"+
+			"─────────────────────\n"+
+			"🟢 <b>سالم و متصل:</b> %d سرور\n"+
+			"🟡 <b>بدون لوکیشن:</b> %d سرور\n"+
+			"🔴 <b>غیرقابل دسترس:</b> %d سرور\n"+
+			"⚪ <b>ردشده:</b> %d سرور\n"+
+			"─────────────────────\n"+
+			"🌍 <b>تعداد کشورها:</b> %d کشور\n"+
+			"⚙️ <b>همزمانی:</b> %d موازی · ⏱️ <b>تایم‌اوت:</b> %d ثانیه\n"+
+			"</blockquote>",
+		res.OK, res.NoCountry, res.Unreachable, res.Skipped,
+		len(res.CountryCodes), cfg.Parallel, cfg.TimeoutSec)
+	_, _ = b.api.sendMessage(chatID, summaryMsg)
+
+	// 2) Working links only (clean output in <pre> or .txt file)
 	if len(res.Links) > 0 {
 		linksBody := strings.Join(res.Links, "\n")
-		cap := fmt.Sprintf("🔗 <b>%d لینک سالم</b> — آماده کپی:", len(res.Links))
-		if cfg.IncludeUnknown && res.NoCountry > 0 {
-			cap += " (شامل " + itoaSafe(res.NoCountry) + " بدون کشور)"
-		}
 		if fitsMsg(linksBody) {
-			_, _ = b.api.sendMessage(chatID, cap+"\n\n<pre>"+escapeHTML(linksBody)+"</pre>")
+			_, _ = b.api.sendMessage(chatID, "<pre>"+escapeHTML(linksBody)+"</pre>")
 		} else {
-			_ = b.api.sendDocument(chatID, []byte(linksBody), "cfgscan_links.txt", cap)
+			_ = b.api.sendDocument(chatID, []byte(linksBody), "configs.txt", fmt.Sprintf("🔗 %d لینک سالم", len(res.Links)))
 		}
 	} else {
-		_, _ = b.api.sendMessage(chatID, "❌ هیچ کانفیگ سالمی در این اسکن یافت نشد.\n\n"+res.Summary(cfg.OutLang))
+		_, _ = b.api.sendMessage(chatID, "❌ هیچ کانفیگ سالمی در این اسکن یافت نشد.")
 	}
 
-	// 2) Standard Country Emojis (اموجی معمولی کشور)
+	// 3) Standard Country Emojis (اموجی معمولی کشور)
 	if len(res.CountryCodes) > 0 {
 		var flagList []string
 		for _, iso := range res.CountryCodes {
 			flagList = append(flagList, engine.Flag(iso))
 		}
 		flagsText := strings.Join(flagList, "  ")
-		_, _ = b.api.sendMessage(chatID, "🌍 <b>پرچم‌های استاندارد</b> (جهت کپی):\n\n<code>"+flagsText+"</code>")
+		_, _ = b.api.sendMessage(chatID, "<code>"+flagsText+"</code>")
 	}
 
-	// 3) Caption
+	// 4) Caption — Sent ALONE without header text so copying copies ONLY the caption
 	if len(res.CountryCodes) > 0 && cfg.CaptionTemplate != "" {
 		caption := b.buildCaption(res.CountryCodes)
 		if caption != "" {
-			_, _ = b.api.sendMessage(chatID, "🏷️ <b>کپشن آماده</b>:\n\n"+escapeHTML(caption))
+			_, _ = b.api.sendMessage(chatID, escapeHTML(caption))
 		}
 	}
 
-	// 4) Message for Users (پیام برای کاربران / داخل کانفیگ)
+	// 5) Message for Users — Sent ALONE without header text
 	if strings.TrimSpace(cfg.MessageForUsers) != "" {
-		_, _ = b.api.sendMessage(chatID, "💬 <b>پیام برای کاربران | Message for users:</b>\n\n"+escapeHTML(cfg.MessageForUsers))
+		_, _ = b.api.sendMessage(chatID, escapeHTML(cfg.MessageForUsers))
 	}
 
-	// 5) Missing emoji codes report (Clean vertical list)
+	// 6) Missing emoji codes report with DIRECT ACTION BUTTONS underneath
 	var missing []string
 	if res.CountryCodes != nil {
 		b.mu.Lock()
@@ -457,6 +470,9 @@ func (b *Bot) startRun(c chat) {
 	}
 	if len(missing) > 0 {
 		var lines []string
+		var btnRows [][]string
+		var currentRow []string
+
 		for i, iso := range missing {
 			flag := engine.Flag(iso)
 			nm, ok := countries.Names(iso, cfg.OutLang)
@@ -464,16 +480,28 @@ func (b *Bot) startRun(c chat) {
 				nm = iso
 			}
 			lines = append(lines, fmt.Sprintf("%d. %s %s (<code>%s</code>)", i+1, flag, nm, iso))
+
+			currentRow = append(currentRow, "✏️ "+flag+" "+nm, "setcode:"+iso)
+			if len(currentRow) == 4 { // 2 buttons per row
+				btnRows = append(btnRows, currentRow)
+				currentRow = nil
+			}
 		}
+		if len(currentRow) > 0 {
+			btnRows = append(btnRows, currentRow)
+		}
+		btnRows = append(btnRows, []string{"📥 وارد کردن دسته‌ای کدها", "cap:import"})
+
 		msg := "🎨 <b>این کشورها کد ایموجی ندارند:</b>\n\n" +
 			strings.Join(lines, "\n") + "\n\n" +
 			"در کپشن برای این‌ها <code>[]</code> خالی قرار گرفته است.\n" +
-			"می‌توانید کدهای آن‌ها را از تب Caption اپ بردارید و با منوی «🏷️ کپشن و پرچم» ثبت نمایید."
-		_, _ = b.api.sendMessage(chatID, msg)
+			"👇 روی دکمه‌ی هر کشور در زیر بزنید تا کد آن را مستقیماً وارد کنید:"
+
+		_, _ = b.api.sendWithKeyboard(chatID, msg, btnRows, "sendMessage")
 	}
 
 	b.finishRunGuard()
-	b.sendMain(c, "✅ <b>پایان اسکن.</b>\n"+res.Summary(cfg.OutLang)+"\n\nاسکن بعدی؟ کانفیگ‌ها را بفرستید یا دکمه‌های زیر را انتخاب کنید:")
+	b.sendMain(c, "✅ <b>پایان اسکن.</b> برای اسکن بعدی کانفیگ‌ها را بفرستید یا از منو انتخاب کنید:")
 }
 
 func fitsMsg(s string) bool {
@@ -702,6 +730,49 @@ func (b *Bot) onCodesExport(c chat) {
 	}
 	_, _ = b.api.sendMessage(c.ID,
 		"📤 <b>خروجی کدهای ایموجی</b> (فرمت مشترک اپ و ربات):\n\n<pre>"+escapeHTML(t)+"</pre>")
+}
+
+func (b *Bot) setCodePrompt(c chat, iso string) {
+	iso = strings.ToUpper(strings.TrimSpace(iso))
+	b.mu.Lock()
+	b.awaiting = awaitCodeSet
+	b.awaitISO = iso
+	b.mu.Unlock()
+
+	flag := engine.Flag(iso)
+	name, _ := countries.Names(iso, "fa")
+	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+		fmt.Sprintf("✏️ <b>ثبت کد ایموجی برای %s %s (%s)</b>\n\n"+
+			"کد عددی ایموجی را ارسال کنید (مثلاً عدد را از تب Caption اپلیکیشن کپی کرده و بفرستید).\n"+
+			"برای حذف کد این کشور، عبارت <code>delete</code> را بفرستید.\n\n"+
+			"برای لغو، دکمه‌ی «↩️ بازگشت به منوی اصلی» را بزنید.", flag, name, iso),
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
+}
+
+func (b *Bot) onSetCode(c chat, iso, text string) {
+	iso = strings.ToUpper(strings.TrimSpace(iso))
+	text = strings.TrimSpace(text)
+	b.mu.Lock()
+	if b.settings.EmojiCodes == nil {
+		b.settings.EmojiCodes = map[string]string{}
+	}
+	if strings.EqualFold(text, "delete") {
+		delete(b.settings.EmojiCodes, iso)
+	} else if text != "" {
+		b.settings.EmojiCodes[iso] = text
+	}
+	b.save()
+	b.mu.Unlock()
+
+	flag := engine.Flag(iso)
+	name, _ := countries.Names(iso, "fa")
+	var msg string
+	if strings.EqualFold(text, "delete") {
+		msg = fmt.Sprintf("🗑️ کد ایموجی %s %s (%s) حذف شد.", flag, name, iso)
+	} else {
+		msg = fmt.Sprintf("✅ کد ایموجی %s %s (%s) با موفقیت ذخیره شد: <code>%s</code>", flag, name, iso, escapeHTML(text))
+	}
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMainMenuFor(c.ID, 0))
 }
 
 // ------------------------------------------------------------------
@@ -979,7 +1050,19 @@ func (b *Bot) handleUpdate(u update) {
 	}
 
 	if u.CallbackQuery != nil {
-		b.api.answerCallback(u.CallbackQuery.ID, "")
+		cq := u.CallbackQuery
+		data := cq.Data
+		b.api.answerCallback(cq.ID, "")
+
+		if strings.HasPrefix(data, "setcode:") {
+			iso := strings.TrimPrefix(data, "setcode:")
+			b.setCodePrompt(c, iso)
+			return
+		}
+		if data == "cap:import" {
+			b.importPrompt(c)
+			return
+		}
 		return
 	}
 
@@ -1138,6 +1221,7 @@ func (b *Bot) handleUpdate(u update) {
 	// Awaiting state
 	b.mu.Lock()
 	aw := b.awaiting
+	iso := b.awaitISO
 	b.mu.Unlock()
 
 	switch aw {
@@ -1178,6 +1262,13 @@ func (b *Bot) handleUpdate(u update) {
 		b.awaiting = awaitNone
 		b.mu.Unlock()
 		b.onCodesImport(c, text)
+		return
+	case awaitCodeSet:
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.mu.Unlock()
+		b.onSetCode(c, iso, text)
 		return
 	case awaitMessageForUsers:
 		b.mu.Lock()

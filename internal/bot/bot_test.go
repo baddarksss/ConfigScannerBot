@@ -56,7 +56,7 @@ func TestReplyMenuStructure(t *testing.T) {
 	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
 	c := chat{ID: 1}
 	b.sendMain(c, "")
-	
+
 	menu := b.replyMainMenuFor(1, 5)
 	if len(menu) == 0 {
 		t.Fatal("main menu must not be empty")
@@ -89,6 +89,26 @@ func TestMessageForUsersPersists(t *testing.T) {
 	s2 := b2.settingsLocked()
 	if s2.MessageForUsers != "" {
 		t.Fatalf("expected empty message, got %q", s2.MessageForUsers)
+	}
+}
+
+func TestSetCodeQuickAndCallback(t *testing.T) {
+	dir := t.TempDir()
+	b := NewBot("token", 1, dir, "xray", "hysteria")
+	c := chat{ID: 1}
+
+	// Direct code set prompt and input
+	b.onSetCode(c, "UZ", "5390843037349679256")
+	s := b.settingsLocked()
+	if s.EmojiCodes["UZ"] != "5390843037349679256" {
+		t.Fatalf("expected UZ code saved, got %q", s.EmojiCodes["UZ"])
+	}
+
+	// Direct deletion
+	b.onSetCode(c, "UZ", "delete")
+	s = b.settingsLocked()
+	if s.EmojiCodes["UZ"] != "" {
+		t.Fatalf("expected UZ code deleted, got %q", s.EmojiCodes["UZ"])
 	}
 }
 

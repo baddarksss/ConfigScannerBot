@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"strings"
 	"sync"
 	"testing"
 )
@@ -61,4 +62,18 @@ func TestNavFlowNoPanic(t *testing.T) {
 	b.nav(c, "world", [][]string{{"b", "noop"}})
 	b.sendMain(c, "")
 	var _ sync.Mutex
+}
+
+// Regression (v1.0.8): outputs were measured in BYTES, but Telegram limits
+// messages in CHARACTERS — Persian text (2 bytes/rune) made small outputs
+// spill into files too early.
+func TestFitsMsgCountsCharacters(t *testing.T) {
+	// ~3900 Persian chars = ~7800 bytes: must FIT (chars < 4000)
+	persian := strings.Repeat("آ", 3900)
+	if !fitsMsg(persian) {
+		t.Fatal("3900 Persian chars must fit (old byte check rejected it)")
+	}
+	if fitsMsg(strings.Repeat("آ", 4500)) {
+		t.Fatal("4500 chars must not fit")
+	}
 }

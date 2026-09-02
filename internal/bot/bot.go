@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.7"
+	BotVersion = "1.0.8"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -353,35 +353,39 @@ func (b *Bot) startRun(c chat) {
 			"✅ <b>اسکن تمام شد</b>\n\n%s", res.Summary(cfg.OutLang)), nil)
 	}
 
-	// 1) full output — text first, file only when it overflows one message
+	// 1) full output — TEXT first, file only when it doesn't fit one message
 	var out strings.Builder
 	for _, l := range res.Lines {
 		out.WriteString(l)
 		out.WriteString("\n")
 	}
 	body := out.String()
-	if len(body) <= tgTextLimit {
+	if fitsMsg(body) {
 		_, _ = b.api.sendMessage(chatID, "📄 <b>خروجی کامل</b>\n\n<pre>"+escapeHTML(body)+"</pre>")
 	} else {
 		_ = b.api.sendDocument(chatID, []byte(body), "cfgscan_results.txt",
-			"📄 <b>خروجی کامل</b> — بیشتر از یک پیام بود، به‌صورت فایل\n"+res.Summary(cfg.OutLang))
+			"📄 <b>خروجی کامل</b> — در یک پیام جا نمی‌شد، به‌صورت فایل\n"+res.Summary(cfg.OutLang))
 	}
 
-	// 2) working links only (file — long)
+	// 2) working links only — same rule: text if it fits, file if not
 	if len(res.Links) > 0 {
+		linksBody := strings.Join(res.Links, "\n")
 		cap := fmt.Sprintf("🔗 <b>%d لینک سالم</b> — فقط لینک‌ها، آماده کپی", len(res.Links))
 		if cfg.IncludeUnknown {
 			cap += " (شامل " + itoaSafe(res.NoCountry) + " بدون کشور)"
 		}
-		_ = b.api.sendDocument(chatID, []byte(strings.Join(res.Links, "\n")),
-			"cfgscan_links.txt", cap)
+		if fitsMsg(linksBody) {
+			_, _ = b.api.sendMessage(chatID, cap+"\n\n<pre>"+escapeHTML(linksBody)+"</pre>")
+		} else {
+			_ = b.api.sendDocument(chatID, []byte(linksBody), "cfgscan_links.txt", cap)
+		}
 	}
 
 	// 3) caption — always as text
 	if res.CountryCodes != nil && cfg.CaptionTemplate != "" {
 		caption := b.buildCaption(res.CountryCodes)
 		if caption != "" {
-			if len(caption) <= tgTextLimit {
+			if fitsMsg(caption) {
 				_, _ = b.api.sendMessage(chatID, "🏷️ <b>کپشن آماده</b> — کپی کن و با فایل کانفیگ‌ها پست کن\n\n"+escapeHTML(caption))
 			} else {
 				_ = b.api.sendDocument(chatID, []byte(caption), "caption.txt",
@@ -412,18 +416,33 @@ func (b *Bot) startRun(c chat) {
 			}
 			names = append(names, flag+" "+nm)
 		}
-		_, _ = b.api.sendWithKeyboard(chatID,
+		// EDIT the "اسکن تمام شد" message in place (no new message)
+		b.nav(c,
 			"🎨 <b>این کشورها کد ایموجی ندارند</b>\n\n"+
 				strings.Join(names, "  ·  ")+"\n\n"+
 				"در کپشن برای این‌ها <code>[]</code> خالی جا می‌گیره. کدشون رو از تپ Caption اپ بردار و اینجا وارد کن:",
-			[][]string{{"🎨 کد ایموجی کشورها", "cap:codes"}}, "sendMessage")
+			[][]string{
+				{"🎨 کد ایموجی کشورها", "cap:codes"},
+				{"📄 لاگ این اجرا", "runlog"},
+			})
+		b.finishRunGuard()
+		return
 	}
 
-	// 5) main menu + run log (same nav message, back in place)
-	rows := b.menuFor(chatID)
-	rows = append([][]string{{"📄 لاگ این اجرا", "runlog"}}, rows...)
-	b.nav(c, "تمام شد ✅\n\n"+res.Summary(cfg.OutLang)+"\n\n🚀 اسکن بعدی؟", rows)
+	// no missing codes: straight to the main menu + run log (same message)
+	{
+		rows := b.menuFor(chatID)
+		rows = append([][]string{{"📄 لاگ این اجرا", "runlog"}}, rows...)
+		b.nav(c, "تمام شد ✅\n\n"+res.Summary(cfg.OutLang)+"\n\n🚀 اسکن بعدی؟", rows)
+	}
 	b.finishRunGuard()
+}
+
+// fitsMsg reports whether s fits in one Telegram message. Telegram counts
+// CHARACTERS, not bytes — Persian/emoji text is 2-4 bytes per rune, so a
+// byte-length check would push small outputs to files too early.
+func fitsMsg(s string) bool {
+	return len([]rune(s)) <= tgTextLimit
 }
 
 // progressBar renders "🟩⬜" (max 20 cells), rounded to the nearest cell.
@@ -461,7 +480,7 @@ func (b *Bot) sendRunLog(c chat) {
 		return
 	}
 	body := strings.Join(logs, "\n")
-	if len(body) <= tgTextLimit {
+	if fitsMsg(body) {
 		_, _ = b.api.sendMessage(c.ID, "📄 <b>لاگ آخرین اجرا</b>\n\n<pre>"+escapeHTML(body)+"</pre>")
 		return
 	}
@@ -488,8 +507,10 @@ func (b *Bot) onCaptionMenu(c chat) {
 		[]string{"↩️ بازگشت", "menu"})
 	b.nav(c,
 		"🏷️ <b>کپشن و پرچم</b>\n\n"+
-			"جای <code>{{FLAGS}}</code> با پرچم‌های همان ران پر می‌شه.\n"+
-			"کد ایموجی = همون اعدادی که توی تپ Caption اپ می‌زنی (custom emoji id).",
+			"کپشن = متنی که زیر پستِ کانفیگ‌ها میذاری. سه تیکه داره:\n\n"+
+			"۱. <b>قالب</b> — متن کپشن؛ جای <code>{{FLAGS}}</code> با پرچم‌های کشورهایی که توی آخرین اسکن پیدا شدن پر می‌شه.\n"+
+			"۲. <b>کد ایموجی</b> — اعداد پرچم‌های پریمیوم هر کشور (همون تپ Caption اپ). با کد → پرچم متحرک؛ بدون کد → <code>[]</code> خالی.\n"+
+			"۳. <b>پیش‌نمایش</b> — کپشن نهاییِ همان ران رو قبل از کپی نشونت میده.",
 		rows)
 }
 
@@ -531,7 +552,7 @@ func (b *Bot) captionPreview(c chat) {
 		_, _ = b.api.sendMessage(c.ID, "کپشنی ساخته نشد.")
 		return
 	}
-	if len(caption) <= tgTextLimit {
+	if fitsMsg(caption) {
 		_, _ = b.api.sendMessage(c.ID, "👁️ <b>پیش‌نمایش کپشن</b> (کشورهای آخرین ران)\n\n"+escapeHTML(caption))
 		return
 	}
@@ -570,7 +591,10 @@ func (b *Bot) onCodesMenu(c chat) {
 
 	var sb strings.Builder
 	sb.WriteString("🎨 <b>کد ایموجی کشورها</b>\n\n")
-	sb.WriteString("📊 " + itoaSafe(len(s.EmojiCodes)) + " کد ثبت شده\n")
+	sb.WriteString("کد = همون <b>عدد</b>ی که پشت پرچم‌های پریمیوم تلگرامه (تپ Caption اپ هم از همین استفاده می‌کنه).\n")
+	sb.WriteString("• با کد → پرچم متحرک توی کپشن\n")
+	sb.WriteString("• بدون کد → <code>[]</code> خالی جا می‌گیره\n\n")
+	sb.WriteString("📊 ثبت شده: " + itoaSafe(len(s.EmojiCodes)) + " کشور\n")
 	if codes != nil {
 		sb.WriteString("\n🌍 <b>کشورهای آخرین ران:</b>\n")
 		for _, iso := range codes {
@@ -582,12 +606,14 @@ func (b *Bot) onCodesMenu(c chat) {
 			if v, has := s.EmojiCodes[iso]; has && v != "" {
 				sb.WriteString(fmt.Sprintf("%s %s — <code>%s</code>\n", flag, name, v))
 			} else {
-				sb.WriteString(fmt.Sprintf("%s %s — <b>کد ندارد</b>\n", flag, name))
+				sb.WriteString(fmt.Sprintf("%s %s — <b>بدون کد</b>\n", flag, name))
 			}
 		}
+		sb.WriteString("\nروی دکمه‌ی هر کشور بزن تا کدش رو ثبت / عوض کنی.")
+	} else {
+		sb.WriteString("\n(اول یک اسکن انجام بده تا کشورهای آخرین ران اینجا بیاد)\n")
+		sb.WriteString("📥/📤 همون فایل بکاپ تپ Caption اپ هست — هر دو طرف راحت می‌خونه و آپدیت می‌مونه.")
 	}
-	sb.WriteString("\nروی دکمه‌ی هر کشور بزن تا کدش رو ثبت یا عوض کنی.\n")
-	sb.WriteString("📥/📤 همون فایل بکاپ تپ Caption اپ هست — هر دو طرف راحت می‌خونه و آپدیت می‌مونه.")
 
 	rows := [][]string{}
 	for _, iso := range codes {
@@ -615,7 +641,9 @@ func (b *Bot) setCodePrompt(c chat, iso string) {
 	name, _ := countries.Names(iso, "fa")
 	b.nav(c,
 		"✏️ <b>کد ایموجی: "+flag+" "+name+"</b>\n\n"+
-			"کد عددی ایموجی رو <b>پیست</b> کن (همون عددی که توی تپ Caption اپ می‌زنی).\n"+
+			"کد = <b>عدد</b> پشت ایموجی پریمیوم.\n"+
+			"در تلگرام: روی پرچمِ پریمیومِ کشور نگه‌دار → کد عددی‌اش را کپی کن و اینجا بفرست.\n"+
+			"(یا از تپ Caption اپ بردار.)\n\n"+
 			"برای حذف کد بنویس: <code>delete</code>",
 		[][]string{{"✖️ لغو", "cap:codes"}})
 }

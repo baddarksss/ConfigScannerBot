@@ -194,7 +194,11 @@ func doQuery(ctx context.Context, client *http.Client, svc service, logf func(st
 		return vote{}, false
 	}
 	if code == "" && country != "" {
-		return vote{code: countryTag(country), country: country}, true
+		resolvedCode := countries.CodeByName(country)
+		if resolvedCode != "" {
+			return vote{code: resolvedCode, country: country}, true
+		}
+		return vote{}, false
 	}
 	if country == "" {
 		if n, ok := countries.Names(code, "en"); ok {
@@ -209,14 +213,6 @@ func doQuery(ctx context.Context, client *http.Client, svc service, logf func(st
 		logf("geo: " + svc.url + " -> " + code + " " + country)
 	}
 	return vote{code: code, country: country, ip: ip}, true
-}
-
-func countryTag(name string) string {
-	name = strings.ToUpper(strings.TrimSpace(name))
-	if len(name) >= 2 {
-		return name[:2]
-	}
-	return name
 }
 
 func topVote(votes []vote) int {

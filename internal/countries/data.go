@@ -274,6 +274,27 @@ func Names(code, lang string) (string, bool) {
 // Known reports whether the ISO code exists in the table.
 func Known(code string) bool { _, ok := byCode[strings.ToUpper(code)]; return ok }
 
+// CodeByName finds the ISO 3166-1 alpha-2 code for a country by its English or Persian name.
+func CodeByName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	lower := strings.ToLower(name)
+	for code, c := range byCode {
+		if strings.EqualFold(c.EN, name) || strings.EqualFold(c.FA, name) ||
+			strings.ToLower(c.EN) == lower || strings.ToLower(c.FA) == lower {
+			return code
+		}
+	}
+	for code, c := range byCode {
+		if strings.Contains(strings.ToLower(c.EN), lower) || strings.Contains(strings.ToLower(c.FA), lower) {
+			return code
+		}
+	}
+	return ""
+}
+
 // All returns every known country in a stable (code) order — used for
 // exporting emoji codes in the same order as the app.
 func All() []Country {

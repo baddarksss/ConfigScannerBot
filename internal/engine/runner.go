@@ -125,22 +125,36 @@ func NewEngine(cfg Config) *Engine {
 	return &Engine{cfg: cfg, seen: map[string]struct{}{}}
 }
 
-// Run tests every server with cfg.Parallel concurrent workers.
+type job struct {
+	index int
+	spec  *ServerSpec
+}
+
+type jobResult struct {
+	index int
+	line  string
+	kind  int
+	code  string
+}
+
+// Run tests every server using a Worker Pool of cfg.Parallel workers.
+// Results and output lines are preserved in exact input order.
 func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 	total := len(servers)
 	res := &RunResult{}
+	if total == 0 {
+		return res
+	}
+
 	var (
-		mu        sync.Mutex
-		doneCount int
-		okLinks   []string
-		unkLinks  []string
-		portSet   = map[int]bool{}
-		portBase  = 21000 + int(time.Now().UnixNano()%500)
+		portMu   sync.Mutex
+		portSet  = map[int]bool{}
+		portBase = 21000 + int(time.Now().UnixNano()%500)
 	)
 
 	nextPort := func() int {
-		mu.Lock()
-		defer mu.Unlock()
+		portMu.Lock()
+		defer portMu.Unlock()
 		for i := 0; i < 20000; i++ {
 			port := (portBase+i)%60000 + 1024
 			if portSet[port] {
@@ -165,57 +179,89 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 		return 25000
 	}
 	releasePort := func(port int) {
-		mu.Lock()
+		portMu.Lock()
 		delete(portSet, port)
-		mu.Unlock()
+		portMu.Unlock()
 	}
 
+	concurrency := e.cfg.Parallel
+	if concurrency > total {
+		concurrency = total
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	jobs := make(chan job, total)
+	results := make(chan jobResult, total)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, e.cfg.Parallel)
-	for _, s := range servers {
-		wg.Add(1)
-		go func(s *ServerSpec) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			port := nextPort()
-			defer releasePort(port)
-			line, kind := e.testOne(s, port)
-			mu.Lock()
-			doneCount++
-			res.Lines = append(res.Lines, line)
-			switch kind {
-			case kOK:
-				res.OK++
-				okLinks = append(okLinks, line)
-			case kPartial:
-				res.NoCountry++
-				unkLinks = append(unkLinks, line)
-			case kFail:
-				res.Unreachable++
-			case kSkip:
-				res.Skipped++
-			}
-			d := doneCount
-			mu.Unlock()
-			if p != nil {
-				mark := "❌"
-				switch kind {
-				case kOK:
-					mark = "✅"
-				case kPartial:
-					mark = "⚠️"
-				case kSkip:
-					mark = "⏭️"
-				}
-				p(d, total, s.hostport(), mark)
-			}
-		}(s)
-	}
-	wg.Wait()
 
-	mu.Lock()
-	res.Lines = append(res.Lines, "", "—— "+res.Summary(e.cfg.OutLang)+" ——")
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				port := nextPort()
+				line, kind, code := e.testOne(j.spec, port)
+				releasePort(port)
+				results <- jobResult{
+					index: j.index,
+					line:  line,
+					kind:  kind,
+					code:  code,
+				}
+			}
+		}()
+	}
+
+	for i, s := range servers {
+		jobs <- job{index: i, spec: s}
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	resultLines := make([]string, total)
+	var okLinks []string
+	var unkLinks []string
+	doneCount := 0
+
+	for r := range results {
+		doneCount++
+		resultLines[r.index] = r.line
+		switch r.kind {
+		case kOK:
+			res.OK++
+			okLinks = append(okLinks, r.line)
+			if r.code != "" {
+				e.noteCountry(r.code)
+			}
+		case kPartial:
+			res.NoCountry++
+			unkLinks = append(unkLinks, r.line)
+		case kFail:
+			res.Unreachable++
+		case kSkip:
+			res.Skipped++
+		}
+		if p != nil {
+			mark := "❌"
+			switch r.kind {
+			case kOK:
+				mark = "✅"
+			case kPartial:
+				mark = "⚠️"
+			case kSkip:
+				mark = "⏭️"
+			}
+			p(doneCount, total, servers[r.index].hostport(), mark)
+		}
+	}
+
+	res.Lines = append(resultLines, "", "—— "+res.Summary(e.cfg.OutLang)+" ——")
 	res.UnknownLinks = unkLinks
 	res.Links = make([]string, 0, len(okLinks)+len(unkLinks))
 	res.Links = append(res.Links, okLinks...)
@@ -224,7 +270,6 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 	}
 	res.CountryCodes = e.codes
 	res.Flags = e.flags
-	mu.Unlock()
 	return res
 }
 
@@ -262,7 +307,7 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
+func (e *Engine) testOne(s *ServerSpec, port int) (string, int, string) {
 	cfg := e.cfg
 	base := s.Name
 	if base == "" {
@@ -278,13 +323,13 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 		if cfg.OutLang == "fa" {
 			msg = "هیستریا v1 توی هسته پشتیبانی نمی‌شه"
 		}
-		return "⚠️ " + base + " — " + msg, kSkip
+		return "⚠️ " + base + " — " + msg, kSkip, ""
 	case "ssr", "tuic", "shadowtls", "anytls", "snic":
 		msg := s.Protocol + " is not in the official core"
 		if cfg.OutLang == "fa" {
 			msg = "پروتکل " + s.Protocol + " توی هسته‌ی رسمی نیست"
 		}
-		return "⚠️ " + base + " — " + msg, kSkip
+		return "⚠️ " + base + " — " + msg, kSkip, ""
 	case "hysteria2":
 		// obfs type without a password cannot be tested at all (app parity)
 		obfsType := strings.ToLower(strings.TrimSpace(s.ExtraRaw))
@@ -293,7 +338,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 			if cfg.OutLang == "fa" {
 				msg = "obfs بدون رمز — قابل تست نیست"
 			}
-			return "⚠️ " + base + " — " + msg, kSkip
+			return "⚠️ " + base + " — " + msg, kSkip, ""
 		}
 	}
 
@@ -319,7 +364,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 	// like the app. All other protocols use Xray.
 	cmd, engineLog, cfgFile := startEngineFor(s, cfg, port)
 	if cmd == nil {
-		return "❌ " + base + " — engine start error", kFail
+		return "❌ " + base + " — engine start error", kFail, ""
 	}
 	defer func() {
 		_ = cmd.Process.Kill()
@@ -341,7 +386,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 	if !up {
 		cfg.Logf(fmt.Sprintf("test: port %d not up after %dms log=%s",
 			port, waitMs, tailFile(engineLog, 200)))
-		return "❌ " + base + " — " + failMsg(cfg.OutLang, "connect"), kFail
+		return "❌ " + base + " — " + failMsg(cfg.OutLang, "connect"), kFail, ""
 	}
 	cfg.Logf(fmt.Sprintf("test: port %d up", port))
 
@@ -371,8 +416,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 		renamed := e.uniqueName(Flag(geo.Code) + " " + countryName) + suffix
 		line := RenameURI(s.Raw, renamed)
 		cfg.Logf("test: OK " + geo.Code + " -> " + renamed)
-		e.noteCountry(geo.Code)
-		return line, kOK
+		return line, kOK, geo.Code
 	}
 
 	// connected but no country — keep the original name (no warning sign);
@@ -395,7 +439,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int) {
 	e.mu.Lock()
 	e.unknown = append(e.unknown, line)
 	e.mu.Unlock()
-	return line, kPartial
+	return line, kPartial, ""
 }
 
 func (e *Engine) noteCountry(code string) {

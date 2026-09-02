@@ -126,6 +126,35 @@ func (a *tgAPI) sendMenu(chatID int64, text string, rows [][]string) (int, error
 	return a.sendWithKeyboard(chatID, text, rows, "sendMessage")
 }
 
+func (a *tgAPI) sendWithReplyKeyboard(chatID int64, text string, rows [][]string) (int, error) {
+	keyboard := make([][]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		rowBtns := make([]map[string]any, 0, len(row))
+		for _, btnText := range row {
+			rowBtns = append(rowBtns, map[string]any{"text": btnText})
+		}
+		if len(rowBtns) > 0 {
+			keyboard = append(keyboard, rowBtns)
+		}
+	}
+	payload := map[string]any{
+		"chat_id":                  chatID,
+		"text":                     text,
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
+		"reply_markup": map[string]any{
+			"keyboard":        keyboard,
+			"resize_keyboard": true,
+			"is_persistent":   true,
+		},
+	}
+	var m tgMessage
+	if err := a.call("sendMessage", payload, &m); err != nil {
+		return 0, err
+	}
+	return m.MessageID, nil
+}
+
 func menuPayload(chatID int64, text string, rows [][]string) map[string]any {
 	return map[string]any{
 		"chat_id":    chatID,

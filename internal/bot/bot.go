@@ -185,6 +185,17 @@ func (b *Bot) navID(chatID int64) int {
 // ------------------------------------------------------------------
 // fixed main menu (the admins row is owner-only)
 
+func (b *Bot) replyMenuFor(id int64) [][]string {
+	rows := [][]string{
+		{"📡 اسکن کانفیگ", "⚙️ تنظیمات"},
+		{"🏷️ کپشن و پرچم", "ℹ️ درباره"},
+	}
+	if id == b.ownerID {
+		rows = append(rows, []string{"👥 ادمین‌ها"})
+	}
+	return rows
+}
+
 func (b *Bot) menuFor(id int64) [][]string {
 	// flat rows: [text1, cb1, text2, cb2]
 	rows := [][]string{
@@ -200,17 +211,21 @@ func (b *Bot) menuFor(id int64) [][]string {
 func (b *Bot) mainIntro() string {
 	return "📡 <b>ConfigScanner Bot</b> <code>v" + BotVersion + "</code>\n\n" +
 		"اسکنر خروجی کانفیگ‌ها — دقیقاً همون منطق اپ:\n" +
-		"• هر سرور با xray جدا تست می‌شه (hy2 با هسته‌ی اصلی hysteria)\n" +
-		"• کشور خروجی با رأی‌گیری ۶ سرویس جیو\n" +
+		"• هر سرور با xray جدا و تخصیص اتمیک پورت تست می‌شه\n" +
+		"• کشور خروجی با استعلام موازی ۶ سرویس جیو\n" +
 		"• خروجی با پرچم و اسم یکتا + کپشن custom emoji\n\n" +
-		"یک دکمه بزن 👇"
+		"از منوی زیر یا دکمه‌ها انتخاب کنید 👇"
 }
 
 func (b *Bot) sendMain(c chat, intro string) {
 	if intro == "" {
 		intro = b.mainIntro()
 	}
-	b.nav(c, intro, b.menuFor(c.ID))
+	b.mu.Lock()
+	b.awaiting = awaitNone
+	b.awaitISO = ""
+	b.mu.Unlock()
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, intro, b.replyMenuFor(c.ID))
 }
 
 // ------------------------------------------------------------------
@@ -353,25 +368,11 @@ func (b *Bot) startRun(c chat) {
 			"✅ <b>اسکن تمام شد</b>\n\n%s", res.Summary(cfg.OutLang)), nil)
 	}
 
-	// 1) full output — TEXT first, file only when it doesn't fit one message
-	var out strings.Builder
-	for _, l := range res.Lines {
-		out.WriteString(l)
-		out.WriteString("\n")
-	}
-	body := out.String()
-	if fitsMsg(body) {
-		_, _ = b.api.sendMessage(chatID, "📄 <b>خروجی کامل</b>\n\n<pre>"+escapeHTML(body)+"</pre>")
-	} else {
-		_ = b.api.sendDocument(chatID, []byte(body), "cfgscan_results.txt",
-			"📄 <b>خروجی کامل</b> — در یک پیام جا نمی‌شد، به‌صورت فایل\n"+res.Summary(cfg.OutLang))
-	}
-
-	// 2) working links only — same rule: text if it fits, file if not
+	// 1) working links only (clean output, ready to copy)
 	if len(res.Links) > 0 {
 		linksBody := strings.Join(res.Links, "\n")
 		cap := fmt.Sprintf("🔗 <b>%d لینک سالم</b> — فقط لینک‌ها، آماده کپی", len(res.Links))
-		if cfg.IncludeUnknown {
+		if cfg.IncludeUnknown && res.NoCountry > 0 {
 			cap += " (شامل " + itoaSafe(res.NoCountry) + " بدون کشور)"
 		}
 		if fitsMsg(linksBody) {
@@ -379,18 +380,15 @@ func (b *Bot) startRun(c chat) {
 		} else {
 			_ = b.api.sendDocument(chatID, []byte(linksBody), "cfgscan_links.txt", cap)
 		}
+	} else {
+		_, _ = b.api.sendMessage(chatID, "❌ هیچ کانفیگ سالمی در این اسکن یافت نشد.\n\n"+res.Summary(cfg.OutLang))
 	}
 
-	// 3) caption — always as text
-	if res.CountryCodes != nil && cfg.CaptionTemplate != "" {
+	// 2) caption — ALWAYS sent as text directly in chat
+	if len(res.CountryCodes) > 0 && cfg.CaptionTemplate != "" {
 		caption := b.buildCaption(res.CountryCodes)
 		if caption != "" {
-			if fitsMsg(caption) {
-				_, _ = b.api.sendMessage(chatID, "🏷️ <b>کپشن آماده</b> — کپی کن و با فایل کانفیگ‌ها پست کن\n\n"+escapeHTML(caption))
-			} else {
-				_ = b.api.sendDocument(chatID, []byte(caption), "caption.txt",
-					"🏷️ <b>کپشن آماده</b> (بسیار طولانی بود)")
-			}
+			_, _ = b.api.sendMessage(chatID, "🏷️ <b>کپشن آماده</b> — کپی کن و با کانفیگ‌ها پست کن:\n\n"+escapeHTML(caption))
 		}
 	}
 
@@ -1104,35 +1102,63 @@ func (b *Bot) handleUpdate(u update) {
 		return
 	}
 
-	switch strings.ToLower(strings.TrimSpace(text)) {
-	case "/start", "/help":
+	cleanText := strings.TrimSpace(text)
+	lowerText := strings.ToLower(cleanText)
+
+	switch {
+	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.pending = nil
+		b.mu.Unlock()
 		b.sendMain(c, "")
 		return
-	case "/settings":
-		b.onSettingsMenu(c)
-		return
-	case "/scan":
+	case cleanText == "📡 اسکن کانفیگ" || lowerText == "/scan":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.mu.Unlock()
 		b.onScanRequest(c)
 		return
-	case "/caption":
+	case cleanText == "⚙️ تنظیمات" || lowerText == "/settings":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.mu.Unlock()
+		b.onSettingsMenu(c)
+		return
+	case cleanText == "🏷️ کپشن و پرچم" || lowerText == "/caption":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.mu.Unlock()
 		b.onCaptionMenu(c)
 		return
-	case "/about":
+	case cleanText == "ℹ️ درباره" || lowerText == "/about":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.mu.Unlock()
 		b.onAbout(c)
 		return
-	case "/id":
+	case cleanText == "👥 ادمین‌ها" || lowerText == "/admins":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.mu.Unlock()
+		b.onAdminMenu(c)
+		return
+	case lowerText == "/id":
 		_, _ = b.api.sendMessage(c.ID, fmt.Sprintf("ID شما: <code>%d</code>", c.ID))
 		return
-	case "/cancel":
+	case lowerText == "/cancel" || cleanText == "لغو":
 		b.mu.Lock()
-		aw := b.awaiting
 		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.pending = nil
 		b.mu.Unlock()
-		if aw != awaitNone {
-			b.nav(c, "✖️ لغو شد.", [][]string{{"↩️ بازگشت", "menu"}})
-			return
-		}
-		b.sendMain(c, "")
+		b.sendMain(c, "✖️ عملیات لغو شد.")
 		return
 	}
 

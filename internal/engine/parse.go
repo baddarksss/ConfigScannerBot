@@ -117,6 +117,9 @@ func splitHostPort(hp string) (string, string) {
 	if hp == "" {
 		return "", ""
 	}
+	for strings.HasSuffix(hp, "/") {
+		hp = strings.TrimSpace(hp[:len(hp)-1])
+	}
 	if strings.HasPrefix(hp, "[") {
 		c := strings.Index(hp, "]")
 		if c < 0 {
@@ -125,7 +128,7 @@ func splitHostPort(hp string) (string, string) {
 		host := hp[1:c]
 		port := ""
 		if c+2 < len(hp) && hp[c+1] == ':' {
-			port = hp[c+2:]
+			port = strings.TrimRight(hp[c+2:], "/")
 		}
 		return host, port
 	}
@@ -133,11 +136,15 @@ func splitHostPort(hp string) (string, string) {
 	if c < 0 {
 		return hp, ""
 	}
-	// unbracketed IPv6 — the last colon is part of the address
+	// unbracketed IPv6 with port (e.g. 2001:db8::1:443) or without port
 	if strings.Contains(hp[:c], ":") {
+		maybePort := strings.TrimRight(hp[c+1:], "/")
+		if isPort(maybePort) && net.ParseIP(hp[:c]) != nil {
+			return hp[:c], maybePort
+		}
 		return hp, ""
 	}
-	maybePort := hp[c+1:]
+	maybePort := strings.TrimRight(hp[c+1:], "/")
 	if isPort(maybePort) {
 		return hp[:c], maybePort
 	}

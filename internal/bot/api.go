@@ -45,7 +45,8 @@ type update struct {
 		Data string `json:"data"`
 		// a callback carries its chat inside "message.chat" (not a flat field)
 		Message *struct {
-			Chat *struct {
+			MessageID int `json:"message_id"`
+			Chat      *struct {
 				ID int64 `json:"id"`
 			} `json:"chat"`
 		} `json:"message"`

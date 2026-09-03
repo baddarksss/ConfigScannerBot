@@ -110,7 +110,6 @@ type Progress func(done, total int, hostport, mark string)
 type Engine struct {
 	cfg     Config
 	mu      sync.Mutex
-	seen    map[string]struct{}
 	unknown []string
 	codes   []string
 	flags   []string
@@ -122,7 +121,7 @@ func NewEngine(cfg Config) *Engine {
 	if err := os.MkdirAll(cfg.WorkDir, 0o755); err != nil {
 		cfg.WorkDir = os.TempDir()
 	}
-	return &Engine{cfg: cfg, seen: map[string]struct{}{}}
+	return &Engine{cfg: cfg}
 }
 
 type job struct {
@@ -387,21 +386,20 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int, string) {
 				countryName = n
 			}
 		}
-		// the counter goes on the flag/country part — never after the
-		// channel suffix ("🇩 Germany 2 | Wpnfa", not "... | Wpnfa 2")
+		// keep the channel suffix on the label end ("🇩🇪 آلمان | Wpnfa").
+		// No dedupe counter: duplicate countries keep the same clean name.
 		suffix := ""
 		if cfg.IncludeChannel && cfg.Channel != "" {
 			suffix = " | " + cfg.Channel
 		}
-		renamed := e.uniqueName(Flag(geo.Code)+" "+countryName) + suffix
+		renamed := Flag(geo.Code) + " " + countryName + suffix
 		line := RenameURI(s.Raw, renamed)
 		cfg.Logf("test: OK " + geo.Code + " -> " + renamed)
 		return line, kOK, geo.Code
 	}
 
 	// connected but no country — keep the original name (no warning sign);
-	// when the config had no name at all, use a neutral word so the dedupe
-	// counter lands before the channel suffix, never after it
+	// when the config had no name at all, use a neutral word
 	baseName := s.Name
 	if baseName == "" {
 		baseName = "unknown"
@@ -413,7 +411,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int, string) {
 	if cfg.IncludeChannel && cfg.Channel != "" {
 		nmSuffix = " | " + cfg.Channel
 	}
-	nm := e.uniqueName(baseName) + nmSuffix
+	nm := baseName + nmSuffix
 	line := RenameURI(s.Raw, nm)
 	cfg.Logf("test: PARTIAL (no country) -> " + nm)
 	e.mu.Lock()
@@ -432,23 +430,6 @@ func (e *Engine) noteCountry(code string) {
 	}
 	e.codes = append(e.codes, code)
 	e.flags = append(e.flags, Flag(code))
-}
-
-// uniqueName: same policy as the app — duplicate labels get a counter.
-func (e *Engine) uniqueName(base string) string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	cand := base
-	n := 2
-	for {
-		if _, ok := e.seen[cand]; !ok {
-			break
-		}
-		cand = base + " " + itoa(n)
-		n++
-	}
-	e.seen[cand] = struct{}{}
-	return cand
 }
 
 func failMsg(lang, kind string) string {

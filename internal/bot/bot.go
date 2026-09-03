@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.13"
+	BotVersion = "1.1.0"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -30,11 +30,34 @@ type Settings struct {
 	Channel        string  `json:"channel"`
 	IncludeChannel bool    `json:"include_channel"`
 	IncludeUnknown bool    `json:"include_unknown"`
-	Admins         []int64 `json:"admins"` // extra users allowed to use the bot
+	Admins         []int64 `json:"admins"` // legacy list — kept in sync for rollback
 
+	AdminsV2        []AdminUser       `json:"admins_v2"` // per-admin permission level
 	CaptionTemplate string            `json:"caption_template"`
 	EmojiCodes      map[string]string `json:"emoji_codes"` // ISO -> custom emoji id
 	MessageForUsers string            `json:"message_for_users"`
+}
+
+// AdminUser is one extra admin with a permission level.
+type AdminUser struct {
+	ID   int64  `json:"id"`
+	Perm string `json:"perm"` // PermFull | PermScan
+}
+
+const (
+	// PermFull: every section (settings, caption, users message…) except
+	// owner-only admin management.
+	PermFull = "full"
+	// PermScan: only the scan flow — submit configs, run, clear, log —
+	// plus the scan output itself (links, caption, users message).
+	PermScan = "scan"
+)
+
+func adminPermLabel(perm string) string {
+	if perm == PermScan {
+		return "📡 فقط اسکن"
+	}
+	return "👑 کامل"
 }
 
 func (s *Settings) defaults() {
@@ -82,6 +105,7 @@ type Bot struct {
 	runChat    int64
 	awaiting   awaiting
 	awaitISO   string // target country for awaitCodeSet
+	awaitAdmin int64  // admin id awaiting a permission choice
 
 	lastCodes []string
 	lastFlags []string
@@ -115,6 +139,12 @@ func (b *Bot) load() {
 		return
 	}
 	_ = json.Unmarshal(bb, &b.settings)
+	// migrate the legacy flat admin list to per-admin permission levels
+	if len(b.settings.AdminsV2) == 0 {
+		for _, id := range b.settings.Admins {
+			b.settings.AdminsV2 = append(b.settings.AdminsV2, AdminUser{ID: id, Perm: PermFull})
+		}
+	}
 	b.settings.defaults()
 }
 
@@ -135,6 +165,8 @@ func (b *Bot) settingsLocked() Settings {
 // ------------------------------------------------------------------
 // access control
 
+// isAllowed: owner or any admin (either permission level) — i.e. the bot
+// answers to them at all.
 func (b *Bot) isAllowed(id int64) bool {
 	if id == b.ownerID {
 		return true
@@ -146,13 +178,105 @@ func (b *Bot) isAllowed(id int64) bool {
 			return true
 		}
 	}
+	for _, a := range b.settings.AdminsV2 {
+		if a.ID == id {
+			return true
+		}
+	}
 	return false
+}
+
+// isFullAdmin: owner or an admin with full permission — everything except
+// owner-only admin management. Only the v2 list decides: the legacy flat
+// list is kept on disk purely so an older binary still boots.
+func (b *Bot) isFullAdmin(id int64) bool {
+	if id == b.ownerID {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, a := range b.settings.AdminsV2 {
+		if a.ID == id && a.Perm != PermScan {
+			return true
+		}
+	}
+	return false
+}
+
+// adminUser returns the AdminUser entry for id (false when not in the v2 list).
+func (b *Bot) adminUser(id int64) (AdminUser, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, a := range b.settings.AdminsV2 {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return AdminUser{}, false
+}
+
+// addOrUpdateAdmin inserts or updates one admin and keeps the legacy flat
+// list in sync (older binaries keep working after a rollback).
+func (b *Bot) addOrUpdateAdmin(id int64, perm string) {
+	b.mu.Lock()
+	replaced := false
+	for i := range b.settings.AdminsV2 {
+		if b.settings.AdminsV2[i].ID == id {
+			b.settings.AdminsV2[i].Perm = perm
+			replaced = true
+		}
+	}
+	if !replaced {
+		b.settings.AdminsV2 = append(b.settings.AdminsV2, AdminUser{ID: id, Perm: perm})
+	}
+	legacy := false
+	for _, a := range b.settings.Admins {
+		if a == id {
+			legacy = true
+		}
+	}
+	if !legacy {
+		b.settings.Admins = append(b.settings.Admins, id)
+	}
+	b.save()
+	b.mu.Unlock()
+}
+
+// removeAdminID drops the admin from both lists; false when it wasn't there.
+func (b *Bot) removeAdminID(id int64) bool {
+	b.mu.Lock()
+	found := false
+	out := b.settings.AdminsV2[:0]
+	for _, a := range b.settings.AdminsV2 {
+		if a.ID == id {
+			found = true
+			continue
+		}
+		out = append(out, a)
+	}
+	b.settings.AdminsV2 = out
+	lout := b.settings.Admins[:0]
+	for _, a := range b.settings.Admins {
+		if a == id {
+			found = true
+			continue
+		}
+		lout = append(lout, a)
+	}
+	b.settings.Admins = lout
+	b.save()
+	b.mu.Unlock()
+	return found
 }
 
 // ------------------------------------------------------------------
 // Reply Keyboards (Fixed Persistent Bottom Buttons)
 
 func (b *Bot) replyMainMenuFor(id int64, pendingCount int) [][]string {
+	if !b.isFullAdmin(id) {
+		// scan-only admin: only the scan flow
+		return b.replyScanMainMenu(pendingCount)
+	}
 	var rows [][]string
 	if pendingCount > 0 {
 		rows = append(rows, []string{
@@ -167,6 +291,29 @@ func (b *Bot) replyMainMenuFor(id int64, pendingCount int) [][]string {
 		rows = append(rows, []string{"👥 ادمین‌ها"})
 	}
 	return rows
+}
+
+// replyScanMainMenu is the reduced persistent keyboard for scan-only admins.
+func (b *Bot) replyScanMainMenu(pendingCount int) [][]string {
+	var rows [][]string
+	if pendingCount > 0 {
+		rows = append(rows, []string{
+			fmt.Sprintf("▶️ شروع اسکن (%d کانفیگ)", pendingCount),
+			"🗑️ پاک کردن لیست",
+		})
+	}
+	rows = append(rows, []string{"📥 ارسال کانفیگ", "📊 گزارش / لاگ"})
+	return rows
+}
+
+// replyScanMenu is the section keyboard shown while the user is inside the
+// scan section — the main-menu buttons disappear until they go back.
+func (b *Bot) replyScanMenu() [][]string {
+	return [][]string{
+		{"▶️ شروع اسکن", "🗑️ پاک کردن لیست"},
+		{"📥 ارسال کانفیگ", "📊 گزارش / لاگ"},
+		{"↩️ بازگشت به منوی اصلی"},
+	}
 }
 
 func (b *Bot) replySettingsMenu() [][]string {
@@ -222,6 +369,29 @@ func (b *Bot) replyAdminMenu() [][]string {
 	}
 }
 
+// adminListKeyboard: one inline row per admin — toggle permission + remove.
+func (b *Bot) adminListKeyboard() [][]string {
+	b.mu.Lock()
+	admins := append([]AdminUser(nil), b.settings.AdminsV2...)
+	b.mu.Unlock()
+	var rows [][]string
+	for _, a := range admins {
+		id := fmt.Sprintf("%d", a.ID)
+		if a.Perm == PermScan {
+			rows = append(rows, []string{
+				"👑 تغییر به کامل", "admtoggle:" + id,
+				"🗑️ حذف", "admdel:" + id,
+			})
+		} else {
+			rows = append(rows, []string{
+				"📡 تغییر به فقط‌اسکن", "admtoggle:" + id,
+				"🗑️ حذف", "admdel:" + id,
+			})
+		}
+	}
+	return rows
+}
+
 func (b *Bot) mainIntro() string {
 	b.mu.Lock()
 	p := len(b.pending)
@@ -248,6 +418,7 @@ func (b *Bot) sendMain(c chat, intro string) {
 	b.mu.Lock()
 	b.awaiting = awaitNone
 	b.awaitISO = ""
+	b.awaitAdmin = 0
 	p := len(b.pending)
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID, intro, b.replyMainMenuFor(c.ID, p))
@@ -268,7 +439,8 @@ func (b *Bot) onScanRequest(c chat) {
 	if p > 0 {
 		msg += fmt.Sprintf("\n\n📥 <b>هم‌اکنون %d کانفیگ در صف آماده است.</b>", p)
 	}
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMainMenuFor(c.ID, p))
+	// scan section keyboard: only scan buttons until «بازگشت به منوی اصلی»
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyScanMenu())
 }
 
 func (b *Bot) onConfigInput(c chat, raw string) {
@@ -292,7 +464,7 @@ func (b *Bot) onConfigInput(c chat, raw string) {
 	if len(lines) == 0 {
 		_, _ = b.api.sendWithReplyKeyboard(c.ID,
 			"🤔 کانفیگی در متن پیدا نشد.\nهر خط باید با یکی از این پروتکل‌ها شروع شود:\n<code>vless:// · vmess:// · trojan:// · ss:// · hysteria2://</code>",
-			b.replyMainMenuFor(c.ID, 0))
+			b.replyScanMenu())
 		return
 	}
 
@@ -307,7 +479,7 @@ func (b *Bot) onConfigInput(c chat, raw string) {
 		"👇 برای شروع اسکن، دکمه‌ی ثابت <b>«▶️ شروع اسکن»</b> را در پایین صفحه لمس کنید:",
 		total, estimateDuration(total, s.Parallel))
 
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, confirm, b.replyMainMenuFor(c.ID, total))
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, confirm, b.replyScanMenu())
 }
 
 func (b *Bot) cancelPending(c chat) {
@@ -326,7 +498,7 @@ func (b *Bot) startRun(c chat) {
 	}
 	if len(b.pending) == 0 {
 		b.mu.Unlock()
-		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 ابتدا کانفیگ‌ها را بفرستید یا پیست کنید.", b.replyMainMenuFor(c.ID, 0))
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 ابتدا کانفیگ‌ها را بفرستید یا پیست کنید.", b.replyScanMenu())
 		return
 	}
 	raw := strings.Join(b.pending, "\n")
@@ -340,7 +512,7 @@ func (b *Bot) startRun(c chat) {
 	servers := engine.ParseInput(raw)
 	if len(servers) == 0 {
 		b.finishRunGuard()
-		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 هیچ خط قابل شناسایی نبود.", b.replyMainMenuFor(c.ID, 0))
+		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 هیچ خط قابل شناسایی نبود.", b.replyScanMenu())
 		return
 	}
 
@@ -922,6 +1094,8 @@ func (b *Bot) cycleSetting(c chat, key string) {
 	b.save()
 	b.mu.Unlock()
 	b.showSettingsMenu(c)
+	// every full admin sees the change immediately, not just the changer
+	b.broadcastSettings(c.ID)
 }
 
 func (b *Bot) channelNamePrompt(c chat) {
@@ -952,20 +1126,25 @@ func (b *Bot) onAdminMenu(c chat) {
 	}
 	b.mu.Lock()
 	s := b.settingsLocked()
+	admins := append([]AdminUser(nil), s.AdminsV2...)
 	b.mu.Unlock()
 	var sb strings.Builder
 	sb.WriteString("👥 <b>ادمین‌های ربات</b>\n\n")
 	sb.WriteString("👑 مالک اصلی: <code>" + itoaSafe(int(b.ownerID)) + "</code>\n\n")
-	if len(s.Admins) == 0 {
+	if len(admins) == 0 {
 		sb.WriteString("<i>(هیچ ادمین اضافی ثبت نشده است)</i>\n")
 	} else {
 		sb.WriteString("<b>لیست ادمین‌ها:</b>\n")
-		for i, a := range s.Admins {
-			sb.WriteString(fmt.Sprintf("%d. <code>%d</code>\n", i+1, a))
+		for i, a := range admins {
+			sb.WriteString(fmt.Sprintf("%d. <code>%d</code> — %s\n", i+1, a.ID, adminPermLabel(a.Perm)))
 		}
 	}
-	sb.WriteString("\nبرای افزودن ادمین روی «➕ افزودن ادمین» بزنید یا برای حذف، <code>/rmadmin ID</code> را ارسال کنید.")
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, sb.String(), b.replyAdminMenu())
+	sb.WriteString("\n📡 <b>فقط اسکن</b>: فقط ارسال کانفیگ، شروع اسکن و دریافت خروجی — بدون دسترسی به تنظیمات و بقیه بخش‌ها.\n" +
+		"👑 <b>کامل</b>: همه بخش‌ها به‌جز مدیریت ادمین‌ها.\n\n" +
+		"برای حذف سریع، <code>/rmadmin ID</code> را هم می‌توانید ارسال کنید.\n" +
+		"برای تغییر سطح یا حذف، از دکمه‌های زیر استفاده کنید:")
+	_, _ = b.api.sendWithKeyboard(c.ID, sb.String(), b.adminListKeyboard(), "sendMessage")
+	_, _ = b.api.sendWithReplyKeyboard(c.ID, "👇 برای افزودن ادمین جدید روی «➕ افزودن ادمین» بزنید یا از «↩️ بازگشت» استفاده کنید.", b.replyAdminMenu())
 }
 
 func (b *Bot) adminAddPrompt(c chat) {
@@ -979,7 +1158,10 @@ func (b *Bot) adminAddPrompt(c chat) {
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"➕ <b>افزودن ادمین جدید</b>\n\n"+
 			"<b>آیدی عددی</b> شخص مورد نظر را بفرستید.\n"+
-			"(آن شخص می‌تواند با ارسال <code>/id</code> به همین ربات، آیدی خود را دریافت کند)",
+			"(آن شخص می‌تواند با ارسال <code>/id</code> به همین ربات، آیدی خود را دریافت کند)\n\n"+
+			"بعد از آیدی، <b>سطح دسترسی</b> را انتخاب می‌کنید:\n"+
+			"👑 کامل — همه بخش‌ها\n"+
+			"📡 فقط اسکن — فقط ارسال کانفیگ و دریافت خروجی",
 		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
 
@@ -1000,20 +1182,38 @@ func (b *Bot) onAdminAdd(c chat, text string) {
 		_, _ = b.api.sendWithReplyKeyboard(c.ID, "شما مالک ربات هستید و دسترسی کامل دارید.", b.replyAdminMenu())
 		return
 	}
-	dup := false
-	for _, a := range b.settings.Admins {
-		if a == id {
-			dup = true
+	if ex, has := b.adminUserLocked(id); has {
+		b.awaiting = awaitNone
+		b.awaitAdmin = id
+		b.mu.Unlock()
+		_, _ = b.api.sendWithKeyboard(c.ID,
+			fmt.Sprintf("این کاربر از قبل با سطح %s ثبت شده — سطح جدید را انتخاب کنید:", adminPermLabel(ex.Perm)),
+			permPickerRows(id), "sendMessage")
+		return
+	}
+	b.awaiting = awaitNone
+	b.awaitAdmin = id
+	b.mu.Unlock()
+	_, _ = b.api.sendWithKeyboard(c.ID,
+		fmt.Sprintf("✏️ سطح دسترسی ادمین <code>%d</code> را انتخاب کنید:", id),
+		permPickerRows(id), "sendMessage")
+}
+
+func permPickerRows(id int64) [][]string {
+	return [][]string{
+		{"👑 کامل", fmt.Sprintf("admperm:%d:full", id)},
+		{"📡 فقط اسکن", fmt.Sprintf("admperm:%d:scan", id)},
+	}
+}
+
+// adminUserLocked is adminUser without re-locking (caller holds b.mu).
+func (b *Bot) adminUserLocked(id int64) (AdminUser, bool) {
+	for _, a := range b.settings.AdminsV2 {
+		if a.ID == id {
+			return a, true
 		}
 	}
-	if !dup {
-		b.settings.Admins = append(b.settings.Admins, id)
-	}
-	b.save()
-	b.mu.Unlock()
-	_, _ = b.api.sendWithReplyKeyboard(c.ID,
-		fmt.Sprintf("✅ کاربر <code>%d</code> با موفقیت به عنوان ادمین ثبت شد.", id),
-		b.replyAdminMenu())
+	return AdminUser{}, false
 }
 
 func (b *Bot) onAdminRemove(c chat, idStr string) {
@@ -1025,26 +1225,165 @@ func (b *Bot) onAdminRemove(c chat, idStr string) {
 	if !ok {
 		return
 	}
-	b.mu.Lock()
-	out := b.settings.Admins[:0]
-	removed := false
-	for _, a := range b.settings.Admins {
-		if a == id {
-			removed = true
-			continue
-		}
-		out = append(out, a)
-	}
-	b.settings.Admins = out
-	b.save()
-	b.mu.Unlock()
-	if !removed {
+	if !b.removeAdminID(id) {
 		_, _ = b.api.sendWithReplyKeyboard(c.ID, "این آیدی در لیست ادمین‌ها نبود.", b.replyAdminMenu())
 		return
 	}
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		fmt.Sprintf("🗑️ دسترسی کاربر <code>%d</code> قطع شد.", id),
 		b.replyAdminMenu())
+}
+
+// routeScanOnly handles (or rejects) input from a scan-only admin: the scan
+// flow plus the log — nothing else, not even via old buttons or commands.
+func (b *Bot) routeScanOnly(c chat, cleanText, lowerText string) {
+	switch {
+	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو" ||
+		cleanText == "↩️ بازگشت به منوی اصلی" || cleanText == "↩️ منوی اصلی":
+		b.sendMain(c, "")
+	case cleanText == "📡 اسکن کانفیگ" || cleanText == "📡 اسکن" ||
+		cleanText == "📥 ارسال کانفیگ" || lowerText == "/scan":
+		b.onScanRequest(c)
+	case strings.HasPrefix(cleanText, "▶️ شروع اسکن") || cleanText == "شروع اسکن" ||
+		cleanText == "شروع" || lowerText == "/run" || lowerText == "/start_scan":
+		b.startRun(c)
+	case cleanText == "🗑️ پاک کردن لیست" || cleanText == "پاک کردن لیست" || cleanText == "حذف لیست":
+		b.cancelPending(c)
+	case cleanText == "📊 گزارش / لاگ" || lowerText == "/log":
+		b.sendRunLog(c)
+	case lowerText == "/id":
+		_, _ = b.api.sendMessage(c.ID, fmt.Sprintf("ID شما: <code>%d</code>", c.ID))
+	case lowerText == "/cancel" || cleanText == "لغو":
+		b.mu.Lock()
+		b.awaiting = awaitNone
+		b.awaitISO = ""
+		b.awaitAdmin = 0
+		b.pending = nil
+		b.mu.Unlock()
+		b.sendMain(c, "✖️ عملیات لغو شد.")
+	default:
+		if strings.Contains(cleanText, "://") {
+			b.onConfigInput(c, cleanText)
+			return
+		}
+		_, _ = b.api.sendMessage(c.ID,
+			"⛔ این بخش فقط برای مالک ربات است — دسترسی شما فقط به بخش اسکن است.")
+	}
+}
+
+// onAdminCallback runs the owner's admin-management buttons
+// (admperm:<id>:<perm> | admdel:<id> | admtoggle:<id>).
+func (b *Bot) onAdminCallback(chatID int64, msgID int, data string) {
+	switch {
+	case strings.HasPrefix(data, "admperm:"):
+		parts := strings.Split(strings.TrimPrefix(data, "admperm:"), ":")
+		if len(parts) != 2 {
+			return
+		}
+		id, ok := parseID(parts[0])
+		if !ok {
+			return
+		}
+		perm := parts[1]
+		if perm != PermFull && perm != PermScan {
+			return
+		}
+		b.addOrUpdateAdmin(id, perm)
+		// inform the admin (silently ignored if they never started the bot)
+		_, _ = b.api.sendMessage(id, fmt.Sprintf("✅ دسترسی شما به ربات ثبت شد: <b>%s</b>", adminPermLabel(perm)))
+		if msgID > 0 {
+			_ = b.api.editText(msgID, chatID, fmt.Sprintf("✅ ادمین <code>%d</code> با سطح <b>%s</b> ثبت شد.", id, adminPermLabel(perm)))
+		}
+	case strings.HasPrefix(data, "admdel:"):
+		id, ok := parseID(strings.TrimPrefix(data, "admdel:"))
+		if !ok {
+			return
+		}
+		b.removeAdminID(id)
+		_, _ = b.api.sendMessage(id, "🗑️ دسترسی شما به ربات حذف شد.")
+		if msgID > 0 {
+			_ = b.api.editText(msgID, chatID, fmt.Sprintf("🗑️ ادمین <code>%d</code> حذف شد.", id))
+		}
+	case strings.HasPrefix(data, "admtoggle:"):
+		id, ok := parseID(strings.TrimPrefix(data, "admtoggle:"))
+		if !ok {
+			return
+		}
+		a, has := b.adminUser(id)
+		if !has {
+			return
+		}
+		np := PermScan
+		if a.Perm == PermScan {
+			np = PermFull
+		}
+		b.addOrUpdateAdmin(id, np)
+		_, _ = b.api.sendMessage(id, fmt.Sprintf("🔁 سطح دسترسی شما تغییر کرد: <b>%s</b>", adminPermLabel(np)))
+		if msgID > 0 {
+			_ = b.api.editText(msgID, chatID, fmt.Sprintf("🔁 سطح ادمین <code>%d</code> به <b>%s</b> تغییر کرد.", id, adminPermLabel(np)))
+		}
+	}
+}
+
+// broadcastSettings pushes the refreshed settings menu to the owner and the
+// other FULL admins, so a change made by one is immediately visible to all
+// (their persistent keyboard would otherwise keep the stale labels).
+func (b *Bot) broadcastSettings(exceptChat int64) {
+	b.mu.Lock()
+	var targets []int64
+	seen := map[int64]bool{}
+	add := func(id int64) {
+		if id == exceptChat || id <= 0 || seen[id] {
+			return
+		}
+		seen[id] = true
+		targets = append(targets, id)
+	}
+	for _, a := range b.settings.AdminsV2 {
+		if a.Perm != PermScan {
+			add(a.ID)
+		}
+	}
+	for _, a := range b.settings.Admins {
+		add(a)
+	}
+	b.mu.Unlock()
+	for _, t := range targets {
+		if !b.isFullAdmin(t) {
+			continue
+		}
+		_, _ = b.api.sendMessage(t, "🔄 <b>تنظیمات به‌روزرسانی شد.</b>")
+		_, _ = b.api.sendWithReplyKeyboard(t, b.settingsSummaryText(), b.replySettingsMenu())
+	}
+}
+
+// settingsSummaryText renders the current settings as a short text block.
+func (b *Bot) settingsSummaryText() string {
+	b.mu.Lock()
+	s := b.settingsLocked()
+	b.mu.Unlock()
+	langName := "فارسی"
+	if s.OutLang == "en" {
+		langName = "English"
+	}
+	chState := "خاموش"
+	if s.IncludeChannel {
+		if s.Channel != "" {
+			chState = "روشن (" + s.Channel + ")"
+		} else {
+			chState = "روشن (بدون نام)"
+		}
+	}
+	unkState := "خاموش"
+	if s.IncludeUnknown {
+		unkState = "روشن"
+	}
+	return "⚙️ <b>تنظیمات فعلی ربات</b>\n\n" +
+		fmt.Sprintf("🔢 همزمانی: <b>%d</b>\n", s.Parallel) +
+		fmt.Sprintf("⏱️ تایم‌اوت: <b>%d ثانیه</b>\n", s.TimeoutSec) +
+		fmt.Sprintf("🌐 زبان: <b>%s</b>\n", langName) +
+		fmt.Sprintf("📢 سافیکس کانال: <b>%s</b>\n", chState) +
+		fmt.Sprintf("🔗 خروجی بدون کشور: <b>%s</b>", unkState)
 }
 
 func parseID(s string) (int64, bool) {
@@ -1106,6 +1445,28 @@ func (b *Bot) handleUpdate(u update) {
 		data := cq.Data
 		b.api.answerCallback(cq.ID, "")
 
+		// owner-only admin-management callbacks
+		if strings.HasPrefix(data, "admperm:") || strings.HasPrefix(data, "admdel:") ||
+			strings.HasPrefix(data, "admtoggle:") {
+			if cq.From == nil || cq.From.ID != b.ownerID {
+				return
+			}
+			var chatID int64
+			var msgID int
+			if cq.Message != nil {
+				msgID = cq.Message.MessageID
+				if cq.Message.Chat != nil {
+					chatID = cq.Message.Chat.ID
+				}
+			}
+			b.onAdminCallback(chatID, msgID, data)
+			return
+		}
+
+		// caption/codes callbacks are not for scan-only admins
+		if !b.isFullAdmin(c.ID) {
+			return
+		}
 		if strings.HasPrefix(data, "setcode:") {
 			iso := strings.TrimPrefix(data, "setcode:")
 			b.setCodePrompt(c, iso)
@@ -1145,11 +1506,18 @@ func (b *Bot) handleUpdate(u update) {
 	cleanText := strings.TrimSpace(text)
 	lowerText := strings.ToLower(cleanText)
 
+	// scan-only admins: only the scan flow. Everything else — settings,
+	// caption, users message, admins — is rejected before any other route.
+	if !b.isFullAdmin(c.ID) {
+		b.routeScanOnly(c, cleanText, lowerText)
+		return
+	}
+
 	switch {
 	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو" || cleanText == "↩️ بازگشت به منوی اصلی" || cleanText == "↩️ منوی اصلی":
 		b.sendMain(c, "")
 		return
-	case cleanText == "📡 اسکن کانفیگ" || lowerText == "/scan":
+	case cleanText == "📡 اسکن کانفیگ" || cleanText == "📡 اسکن" || cleanText == "📥 ارسال کانفیگ" || lowerText == "/scan":
 		b.onScanRequest(c)
 		return
 	case strings.HasPrefix(cleanText, "▶️ شروع اسکن") || cleanText == "شروع اسکن" || cleanText == "شروع" || lowerText == "/run" || lowerText == "/start_scan":
@@ -1245,6 +1613,7 @@ func (b *Bot) handleUpdate(u update) {
 		b.mu.Lock()
 		b.awaiting = awaitNone
 		b.awaitISO = ""
+		b.awaitAdmin = 0
 		b.pending = nil
 		b.mu.Unlock()
 		b.sendMain(c, "✖️ عملیات لغو شد.")
@@ -1283,6 +1652,7 @@ func (b *Bot) handleUpdate(u update) {
 				"✅ سافیکس کانال <b>روشن</b> شد:\n<pre>🇩🇪 آلمان | "+escapeHTML(name)+"</pre>",
 				b.replySettingsMenu())
 		}
+		b.broadcastSettings(c.ID)
 		return
 	case awaitAdminAdd:
 		b.mu.Lock()

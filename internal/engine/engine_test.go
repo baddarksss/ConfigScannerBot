@@ -7,21 +7,13 @@ import (
 )
 
 func TestUniqueNameAndRename(t *testing.T) {
-	e := NewEngine(Config{XrayBin: "/bin/true", Channel: "Wpnfa", IncludeChannel: true, OutLang: "fa"})
-	if got := e.uniqueName("🇫🇷 فرانسه | Wpnfa"); got != "🇫🇷 فرانسه | Wpnfa" {
-		t.Fatal("first should stay clean:", got)
+	// since v1.1.0 duplicate labels keep the SAME clean name — no counters
+	// ("آلمان 2" is gone; two German servers both stay "🇩🇪 آلمان | Wpnfa")
+	if got := labelWithSuffix("🇩🇪 آلمان", " | Wpnfa"); got != "🇩🇪 آلمان | Wpnfa" {
+		t.Fatal("label:", got)
 	}
-	if got := e.uniqueName("🇫🇷 فرانسه | Wpnfa"); got != "🇫🇷 فرانسه | Wpnfa 2" {
-		t.Fatal("second should get counter:", got)
-	}
-	if got := e.uniqueName("🇫🇷 فرانسه | Wpnfa"); got != "🇫🇷 فرانسه | Wpnfa 3" {
-		t.Fatal("third should get 3:", got)
-	}
-	if got := e.uniqueName("Wpnfa"); got != "Wpnfa" {
-		t.Fatal("different base should not collide:", got)
-	}
-	if got := e.uniqueName("Wpnfa"); got != "Wpnfa 2" {
-		t.Fatal("second Wpnfa should counter:", got)
+	if got := labelWithSuffix("🇩🇪 آلمان", " | Wpnfa"); got != "🇩🇪 آلمان | Wpnfa" {
+		t.Fatal("duplicate must not get a counter:", got)
 	}
 	// rename (spaces are %20-encoded in the fragment, exactly like the app)
 	if got := RenameURI("trojan://a@1.1.1.1:443#X", "DE Name | Wpnfa"); got != "trojan://a@1.1.1.1:443#DE%20Name%20|%20Wpnfa" {
@@ -38,6 +30,10 @@ func TestUniqueNameAndRename(t *testing.T) {
 		t.Fatal("flag DE:", got)
 	}
 }
+
+// labelWithSuffix mirrors the naming used by testOne (kept trivial here so
+// the regression is about the *absence* of the counter).
+func labelWithSuffix(base, suffix string) string { return base + suffix }
 
 func TestParseBasics(t *testing.T) {
 	s := ParseOne("vless://uuid-x@62.133.62.179:443?security=reality&pbk=abc&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=telegraf.lv&sid=e5f67890#نام%20تست")

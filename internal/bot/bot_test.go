@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -269,3 +271,145 @@ func TestOnConfigInputCountsOnlyParseable(t *testing.T) {
 }
 
 func b64std(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+// ------------------------------------------------------------------
+// v1.1.0 — permission levels, section keyboards, settings broadcast
+
+// Legacy flat admin ids must migrate to full-permission AdminUser entries.
+func TestAdminMigrationFromLegacy(t *testing.T) {
+	dir := t.TempDir()
+	legacy := []byte(`{"parallel":4,"admins":[42,43]}`)
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := NewBot("token", 1, dir, "xray", "hysteria")
+	if !b.isAllowed(42) || !b.isAllowed(43) {
+		t.Fatal("legacy admins must stay allowed")
+	}
+	if !b.isFullAdmin(42) {
+		t.Fatal("legacy admins migrate to FULL permission")
+	}
+	a, ok := b.adminUser(42)
+	if !ok || a.Perm != PermFull {
+		t.Fatalf("migration entry: %+v ok=%v", a, ok)
+	}
+}
+
+// Scan-only admins: allowed into the bot, but not into full-admin power.
+func TestScanOnlyPermission(t *testing.T) {
+	dir := t.TempDir()
+	b := NewBot("token", 1, dir, "xray", "hysteria")
+	b.addOrUpdateAdmin(77, PermScan)
+	b.addOrUpdateAdmin(88, PermFull)
+
+	if !b.isAllowed(77) || b.isFullAdmin(77) {
+		t.Fatal("scan admin: allowed but not full")
+	}
+	if !b.isAllowed(88) || !b.isFullAdmin(88) {
+		t.Fatal("full admin broken")
+	}
+
+	// persistence
+	b2 := NewBot("token", 1, dir, "xray", "hysteria")
+	if a, ok := b2.adminUser(77); !ok || a.Perm != PermScan {
+		t.Fatalf("perm not persisted: %+v", a)
+	}
+	if !b2.isFullAdmin(88) {
+		t.Fatal("full admin not persisted")
+	}
+
+	// toggle + remove
+	b2.addOrUpdateAdmin(77, PermFull)
+	if !b2.isFullAdmin(77) {
+		t.Fatal("toggle to full failed")
+	}
+	if !b2.removeAdminID(88) {
+		t.Fatal("remove failed")
+	}
+	if b2.isAllowed(88) {
+		t.Fatal("removed admin still allowed")
+	}
+}
+
+// The scan-only keyboard must not expose settings/caption/... buttons.
+func TestScanOnlyKeyboard(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.addOrUpdateAdmin(77, PermScan)
+
+	for _, row := range b.replyMainMenuFor(77, 0) {
+		for _, btn := range row {
+			for _, banned := range []string{"تنظیمات", "کپشن", "پیام برای کاربران", "ادمین", "راهنما"} {
+				if strings.Contains(btn, banned) {
+					t.Fatalf("scan-only menu shows %q button", banned)
+				}
+			}
+		}
+	}
+	// owner still sees everything
+	joined := ""
+	for _, row := range b.replyMainMenuFor(1, 0) {
+		joined += strings.Join(row, "|")
+	}
+	for _, want := range []string{"تنظیمات", "کپشن", "ادمین"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("owner menu lost %q: %s", want, joined)
+		}
+	}
+}
+
+// routeScanOnly: scan commands allowed, everything else rejected.
+func TestRouteScanOnly(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.addOrUpdateAdmin(77, PermScan)
+	c := chat{ID: 77}
+
+	b.routeScanOnly(c, "⚙️ تنظیمات", "⚙️ تنظیمات") // must NOT open settings
+	b.mu.Lock()
+	aw := b.awaiting
+	b.mu.Unlock()
+	if aw != awaitNone {
+		t.Fatal("scan admin reached an awaiting state")
+	}
+
+	// config submission still works for scan admins
+	b.routeScanOnly(c, "vless://u@1.2.3.4:443#x", "vless://u@1.2.3.4:443#x")
+	b.mu.Lock()
+	pending := len(b.pending)
+	b.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("scan admin config submission broken: pending=%d", pending)
+	}
+
+	// start scan allowed
+	b.routeScanOnly(c, "▶️ شروع اسکن", "▶️ شروع اسکن")
+
+	// unknown text rejected (no queue pollution, no settings change)
+	b.routeScanOnly(c, "hello world", "hello world")
+	b.mu.Lock()
+	par := b.settings.Parallel
+	b.mu.Unlock()
+	if par != 4 {
+		t.Fatalf("settings changed via scan-only route: %d", par)
+	}
+}
+
+// Adding an admin through addOrUpdateAdmin keeps the legacy list in sync.
+func TestAddAdminLegacySync(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.addOrUpdateAdmin(55, PermScan)
+	b.mu.Lock()
+	legacy := false
+	for _, a := range b.settings.Admins {
+		if a == 55 {
+			legacy = true
+		}
+	}
+	v2 := len(b.settings.AdminsV2)
+	b.mu.Unlock()
+	if !legacy {
+		t.Fatal("legacy list not synced — a rollback would drop this admin")
+	}
+	if v2 != 1 {
+		t.Fatalf("v2 list = %d entries", v2)
+	}
+}

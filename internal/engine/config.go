@@ -15,9 +15,9 @@ func BuildFull(s *ServerSpec, port int, logPath string) (string, error) {
 		log["access"] = logPath
 	}
 	in := map[string]any{
-		"tag":    "in",
-		"listen": "127.0.0.1",
-		"port":   port,
+		"tag":      "in",
+		"listen":   "127.0.0.1",
+		"port":     port,
 		"protocol": "socks",
 		"settings": map[string]any{"udp": false, "auth": "noauth", "ip": "127.0.0.1"},
 	}
@@ -43,9 +43,9 @@ func BuildFull(s *ServerSpec, port int, logPath string) (string, error) {
 		so["dialerProxy"] = "fragment"
 		so["tcpNoDelay"] = true
 		fragOut = map[string]any{
-			"tag":        "fragment",
-			"protocol":   "freedom",
-			"settings":   fragSet,
+			"tag":      "fragment",
+			"protocol": "freedom",
+			"settings": fragSet,
 			"streamSettings": map[string]any{
 				"sockopt": map[string]any{"tcpNoDelay": true},
 			},
@@ -113,9 +113,9 @@ func buildOutbound(s *ServerSpec) (any, error) {
 					"address": s.Host,
 					"port":    s.Port,
 					"users": []any{map[string]any{
-						"id":        s.UUID,
-						"alterId":   s.AlterID,
-						"security":  firstNonEmpty(s.Cipher, "auto"),
+						"id":       s.UUID,
+						"alterId":  s.AlterID,
+						"security": firstNonEmpty(s.Cipher, "auto"),
 					}},
 				}},
 			},
@@ -234,21 +234,21 @@ func buildStreamSettings(s *ServerSpec) (map[string]any, error) {
 					t["alpn"] = a
 				}
 			}
-		// ECH: panels send a resolver hint (ip.gs+udp://…); xray 26.x
-		// "half" = resolve the ECH config itself when advertised
-		if s.ECH != "" {
-			t["echForceQuery"] = "half"
-			if len(s.ECH) > 25 && !strings.Contains(s.ECH, "/") &&
-				!strings.Contains(s.ECH, "+") && !strings.Contains(s.ECH, ":") &&
-				!strings.Contains(s.ECH, "?") {
-				t["echConfig"] = s.ECH
+			// ECH: panels send a resolver hint (ip.gs+udp://…); xray 26.x
+			// "half" = resolve the ECH config itself when advertised
+			if s.ECH != "" {
+				t["echForceQuery"] = "half"
+				if len(s.ECH) > 25 && !strings.Contains(s.ECH, "/") &&
+					!strings.Contains(s.ECH, "+") && !strings.Contains(s.ECH, ":") &&
+					!strings.Contains(s.ECH, "?") {
+					t["echConfig"] = s.ECH
+				}
 			}
-		}
-		// self-signed / insecure=1: pin the leaf cert fetched at test start
-		if s.PinnedCert != "" {
-			t["pinnedPeerCertSha256"] = s.PinnedCert
-		}
-		st["tlsSettings"] = t
+			// self-signed / insecure=1: pin the leaf cert fetched at test start
+			if s.PinnedCert != "" {
+				t["pinnedPeerCertSha256"] = s.PinnedCert
+			}
+			st["tlsSettings"] = t
 		}
 	}
 	if s.Network == "ws" {

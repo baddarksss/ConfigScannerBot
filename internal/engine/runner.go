@@ -108,8 +108,8 @@ type Progress func(done, total int, hostport, mark string)
 
 // Engine runs a batch of servers, exactly like the app's run.
 type Engine struct {
-	cfg Config
-	mu  sync.Mutex
+	cfg     Config
+	mu      sync.Mutex
 	seen    map[string]struct{}
 	unknown []string
 	codes   []string
@@ -287,26 +287,6 @@ func (s *ServerSpec) hostport() string {
 	return fmt.Sprintf("%s:%d", s.Host, s.Port)
 }
 
-func isLink(t string) bool {
-	for _, p := range []string{"vless://", "vmess://", "trojan://", "ss://",
-		"socks://", "ssr://", "tuic://", "shadowtls://", "anytls://",
-		"snic://", "hysteria2://", "hy2://"} {
-		if strings.HasPrefix(t, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}
-
 func (e *Engine) testOne(s *ServerSpec, port int) (string, int, string) {
 	cfg := e.cfg
 	base := s.Name
@@ -413,7 +393,7 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int, string) {
 		if cfg.IncludeChannel && cfg.Channel != "" {
 			suffix = " | " + cfg.Channel
 		}
-		renamed := e.uniqueName(Flag(geo.Code) + " " + countryName) + suffix
+		renamed := e.uniqueName(Flag(geo.Code)+" "+countryName) + suffix
 		line := RenameURI(s.Raw, renamed)
 		cfg.Logf("test: OK " + geo.Code + " -> " + renamed)
 		return line, kOK, geo.Code
@@ -543,7 +523,7 @@ func startEngineFor(s *ServerSpec, cfg Config, port int) (*exec.Cmd, string, str
 func startHysteria(s *ServerSpec, cfg Config, port int) (*exec.Cmd, string, string) {
 	engineLog := filepath.Join(cfg.WorkDir, "hy2w_"+itoa(port)+".log")
 	var y strings.Builder
-	y.WriteString("server: " + s.hostport() + "\n")
+	y.WriteString("server: " + hysteriaServerAddr(s.Host, s.Port) + "\n")
 	y.WriteString("auth: " + yamlQuote(s.Password) + "\n")
 	y.WriteString("tls:\n")
 	sni := s.SNI
@@ -588,6 +568,16 @@ func startHysteria(s *ServerSpec, cfg Config, port int) (*exec.Cmd, string, stri
 	// the child keeps the log open; closing our handle is fine
 	_ = logF.Close()
 	return cmd, engineLog, cfgFile
+}
+
+// hysteriaServerAddr formats the server address for the hysteria client
+// YAML. A bare IPv6 literal ("2001:db8::1:443") is invalid — it needs
+// brackets: "[2001:db8::1]:443".
+func hysteriaServerAddr(host string, port int) string {
+	if strings.Contains(host, ":") && net.ParseIP(host) != nil {
+		return "[" + host + "]:" + itoa(port)
+	}
+	return host + ":" + itoa(port)
 }
 
 func yamlQuote(v string) string {

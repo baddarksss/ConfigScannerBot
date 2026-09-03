@@ -266,8 +266,12 @@ var byCode = map[string]Country{
 // Names returns the country name in the given language ("fa" or "en").
 func Names(code, lang string) (string, bool) {
 	c, ok := byCode[strings.ToUpper(code)]
-	if !ok { return "", false }
-	if lang == "fa" { return c.FA, true }
+	if !ok {
+		return "", false
+	}
+	if lang == "fa" {
+		return c.FA, true
+	}
 	return c.EN, true
 }
 

@@ -41,7 +41,7 @@ func TestLiveSendMenu(t *testing.T) {
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var res struct {
-		OK     bool   `json:"ok"`
+		OK     bool `json:"ok"`
 		Result struct {
 			MessageID int `json:"message_id"`
 		} `json:"result"`
@@ -57,10 +57,10 @@ func TestLiveSendMenu(t *testing.T) {
 
 	// now edit the SAME message (nav in-place behaviour)
 	edit := map[string]any{
-		"chat_id":      chatID,
-		"message_id":   res.Result.MessageID,
-		"text":         "✅ <b>تست ادیت درجا</b>\n\nهمین پیام ادیت شد — پیام جدیدی ساخته نشد. دکمه‌های جدید:",
-		"parse_mode":   "HTML",
+		"chat_id":    chatID,
+		"message_id": res.Result.MessageID,
+		"text":       "✅ <b>تست ادیت درجا</b>\n\nهمین پیام ادیت شد — پیام جدیدی ساخته نشد. دکمه‌های جدید:",
+		"parse_mode": "HTML",
 		"reply_markup": map[string]any{
 			"inline_keyboard": buildKeyboard([][]string{
 				{"🟩 ادیت درجا تأیید شد", "noop"},

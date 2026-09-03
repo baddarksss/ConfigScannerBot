@@ -80,31 +80,47 @@ func (a *tgAPI) call(method string, payload map[string]any, out any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := a.http.Post(
-		"https://api.telegram.org/bot"+a.token+"/"+method,
-		"application/json", bytes.NewReader(b))
-	if err != nil {
-		fmt.Printf("TG API %s: %v\n", method, err)
-		return err
+	u := "https://api.telegram.org/bot" + a.token + "/" + method
+	for attempt := 0; ; attempt++ {
+		resp, err := a.http.Post(u, "application/json", bytes.NewReader(b))
+		if err != nil {
+			fmt.Printf("TG API %s: %v\n", method, err)
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		var res struct {
+			OK     bool            `json:"ok"`
+			Result json.RawMessage `json:"result"`
+			Err    string          `json:"description"`
+			Params *struct {
+				RetryAfter int `json:"retry_after"`
+			} `json:"parameters"`
+		}
+		if err := json.Unmarshal(body, &res); err != nil {
+			return fmt.Errorf("tg %s: bad response: %s", method, body[:min(len(body), 300)])
+		}
+		if !res.OK {
+			// flood control: wait retry_after (capped) and retry a couple of
+			// times instead of dropping the message
+			if resp.StatusCode == http.StatusTooManyRequests && res.Params != nil &&
+				res.Params.RetryAfter > 0 && attempt < 2 {
+				wait := res.Params.RetryAfter
+				if wait > 15 {
+					wait = 15
+				}
+				fmt.Printf("TG API %s: flood limited, retrying in %ds\n", method, wait)
+				time.Sleep(time.Duration(wait) * time.Second)
+				continue
+			}
+			fmt.Printf("TG API %s error: %s\n", method, res.Err)
+			return fmt.Errorf("tg %s: %s", method, res.Err)
+		}
+		if out != nil && len(res.Result) > 0 {
+			return json.Unmarshal(res.Result, out)
+		}
+		return nil
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	var res struct {
-		OK      bool `json:"ok"`
-		Result  json.RawMessage `json:"result"`
-		Err     string `json:"description"`
-	}
-	if err := json.Unmarshal(body, &res); err != nil {
-		return fmt.Errorf("tg %s: bad response: %s", method, body[:min(len(body), 300)])
-	}
-	if !res.OK {
-		fmt.Printf("TG API %s error: %s\n", method, res.Err)
-		return fmt.Errorf("tg %s: %s", method, res.Err)
-	}
-	if out != nil && len(res.Result) > 0 {
-		return json.Unmarshal(res.Result, out)
-	}
-	return nil
 }
 
 type tgMessage struct {
@@ -114,16 +130,12 @@ type tgMessage struct {
 func (a *tgAPI) sendMessage(chatID int64, text string) (int, error) {
 	var m tgMessage
 	err := a.call("sendMessage", map[string]any{
-		"chat_id":    chatID,
-		"text":       text,
-		"parse_mode": "HTML",
+		"chat_id":                  chatID,
+		"text":                     text,
+		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
 	}, &m)
 	return m.MessageID, err
-}
-
-func (a *tgAPI) sendMenu(chatID int64, text string, rows [][]string) (int, error) {
-	return a.sendWithKeyboard(chatID, text, rows, "sendMessage")
 }
 
 func (a *tgAPI) sendWithReplyKeyboard(chatID int64, text string, rows [][]string) (int, error) {
@@ -157,9 +169,9 @@ func (a *tgAPI) sendWithReplyKeyboard(chatID int64, text string, rows [][]string
 
 func menuPayload(chatID int64, text string, rows [][]string) map[string]any {
 	return map[string]any{
-		"chat_id":    chatID,
-		"text":       text,
-		"parse_mode": "HTML",
+		"chat_id":                  chatID,
+		"text":                     text,
+		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
 		"reply_markup": map[string]any{
 			"inline_keyboard": buildKeyboard(rows),
@@ -198,20 +210,20 @@ func (a *tgAPI) sendWithKeyboard(chatID int64, text string, rows [][]string, met
 
 func (a *tgAPI) editText(messageID int, chatID int64, text string) error {
 	return a.call("editMessageText", map[string]any{
-		"chat_id":      chatID,
-		"message_id":   messageID,
-		"text":         text,
-		"parse_mode":   "HTML",
+		"chat_id":                  chatID,
+		"message_id":               messageID,
+		"text":                     text,
+		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
 	}, nil)
 }
 
 func (a *tgAPI) editKeyboard(messageID int, chatID int64, text string, rows [][]string) error {
 	payload := map[string]any{
-		"chat_id":      chatID,
-		"message_id":   messageID,
-		"text":         text,
-		"parse_mode":   "HTML",
+		"chat_id":                  chatID,
+		"message_id":               messageID,
+		"text":                     text,
+		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
 	}
 	if kb := buildKeyboard(rows); len(kb) > 0 {
@@ -250,7 +262,7 @@ func (a *tgAPI) sendDocument(chatID int64, fileBytes []byte, fileName, caption s
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var res struct {
-		OK  bool `json:"ok"`
+		OK  bool   `json:"ok"`
 		Err string `json:"description"`
 	}
 	json.Unmarshal(rb, &res)
@@ -259,6 +271,11 @@ func (a *tgAPI) sendDocument(chatID int64, fileBytes []byte, fileName, caption s
 	}
 	return nil
 }
+
+// tgMaxDownload is the Bot API's file-download cap (20 MB). The old 5 MB
+// LimitReader silently truncated bigger files — half a config list arrived
+// with no error at all.
+const tgMaxDownload = 20 << 20
 
 func (a *tgAPI) getFileBytes(fileID string) ([]byte, error) {
 	var out struct {
@@ -273,7 +290,14 @@ func (a *tgAPI) getFileBytes(fileID string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, tgMaxDownload+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > tgMaxDownload {
+		return nil, fmt.Errorf("file larger than %d MB", tgMaxDownload>>20)
+	}
+	return b, nil
 }
 
 // getUpdates long-polls.
@@ -292,5 +316,3 @@ func (a *tgAPI) deleteMessage(chatID int64, messageID int) error {
 		"message_id": messageID,
 	}, nil)
 }
-
-

@@ -29,10 +29,10 @@ type GeoResult struct {
 
 // services: {url, countryField, codeField, successField-or-empty}
 type service struct {
-	url       string
-	countryF  string
-	codeF     string
-	successF  string
+	url      string
+	countryF string
+	codeF    string
+	successF string
 }
 
 var services = []service{

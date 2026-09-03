@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
 	"cfgscanbot/internal/bot"
 )
@@ -12,6 +13,12 @@ func envOr(key, dflt string) string {
 		return v
 	}
 	return dflt
+}
+
+// findBinary resolves a binary name via PATH (absolute paths pass through).
+func findBinary(path string) error {
+	_, err := exec.LookPath(path)
+	return err
 }
 
 func main() {
@@ -37,11 +44,13 @@ func main() {
 
 	// sanity: xray binary must be present; the hysteria binary is only
 	// needed for hy2 links, so a missing one is a warning, not fatal.
-	if _, err := os.Stat(xrayBin); err != nil {
+	// LookPath (not os.Stat): the default "xray" lives on PATH — os.Stat
+	// only checks the working directory and killed the bot on a valid setup.
+	if err := findBinary(xrayBin); err != nil {
 		fmt.Fprintf(os.Stderr, "xray binary not found at %s (set XRAY_BIN)\n", xrayBin)
 		os.Exit(1)
 	}
-	if _, err := os.Stat(hyBin); err != nil {
+	if err := findBinary(hyBin); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: hysteria binary not found at %s — hy2 links will fail\n", hyBin)
 	}
 

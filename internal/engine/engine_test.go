@@ -180,25 +180,74 @@ func TestIncludeUnknownFiltering(t *testing.T) {
 	e1 := NewEngine(Config{XrayBin: "/bin/true", IncludeUnknown: false})
 	okLinks := []string{"vless://ok#DE%20Germany"}
 	unkLinks := []string{"vless://unk#unknown"}
-	
+
 	resFalse := &RunResult{
-		OK: len(okLinks),
-		NoCountry: len(unkLinks),
+		OK:           len(okLinks),
+		NoCountry:    len(unkLinks),
 		UnknownLinks: unkLinks,
-		Links: append([]string{}, okLinks...),
+		Links:        append([]string{}, okLinks...),
 	}
 	if len(resFalse.Links) != 1 || resFalse.Links[0] != okLinks[0] {
 		t.Fatalf("IncludeUnknown=false should only contain okLinks: %+v", resFalse.Links)
 	}
 
 	resTrue := &RunResult{
-		OK: len(okLinks),
-		NoCountry: len(unkLinks),
+		OK:           len(okLinks),
+		NoCountry:    len(unkLinks),
 		UnknownLinks: unkLinks,
-		Links: append(append([]string{}, okLinks...), unkLinks...),
+		Links:        append(append([]string{}, okLinks...), unkLinks...),
 	}
 	if len(resTrue.Links) != 2 {
 		t.Fatalf("IncludeUnknown=true should contain both: %+v", resTrue.Links)
 	}
 	_ = e1
+}
+
+// Regression (v1.0.13): "port" arrives as a JSON number in most vmess
+// exports (v2rayN, panels); it used to fall back to 443 silently and the
+// wrong server got tested.
+func TestParseVmessNumericPort(t *testing.T) {
+	s := ParseOne(`vmess://` + b64url(`{"v":"2","ps":"n","add":"1.2.3.4","port":8443,"id":"u","aid":0,"net":"ws","tls":"tls"}`))
+	if s == nil || s.Port != 8443 {
+		t.Fatalf("numeric port lost: %+v", s)
+	}
+	s2 := ParseOne(`vmess://` + b64url(`{"add":"1.2.3.4","port":"1234","id":"u"}`))
+	if s2 == nil || s2.Port != 1234 {
+		t.Fatalf("string port lost: %+v", s2)
+	}
+	s3 := ParseOne(`vmess://` + b64url(`{"add":"1.2.3.4","port":80,"id":"u","net":"tcp"}`))
+	if s3 == nil || s3.Port != 80 {
+		t.Fatalf("port 80 lost: %+v", s3)
+	}
+}
+
+// Regression (v1.0.13): SIP002 plain / percent-encoded userinfo used to be
+// dropped silently (only base64 was accepted).
+func TestParseSSUserinfoVariants(t *testing.T) {
+	plain := ParseOne("ss://aes-256-gcm:secretpass@1.2.3.4:8388#plain")
+	if plain == nil || plain.Method != "aes-256-gcm" || plain.Password != "secretpass" || plain.Port != 8388 {
+		t.Fatalf("plain userinfo: %+v", plain)
+	}
+	pct := ParseOne("ss://aes-256-gcm:sec%40pass%3Aword@1.2.3.4:8388#pct")
+	if pct == nil || pct.Method != "aes-256-gcm" || pct.Password != "sec@pass:word" {
+		t.Fatalf("percent-encoded userinfo: %+v", pct)
+	}
+	b64l := ParseOne("ss://" + base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secretpass")) + "@1.2.3.4:8388#b64")
+	if b64l == nil || b64l.Method != "aes-256-gcm" || b64l.Password != "secretpass" {
+		t.Fatalf("base64 userinfo: %+v", b64l)
+	}
+}
+
+// Regression (v1.0.13): a bare IPv6 literal produced an invalid hysteria
+// YAML "server:" line.
+func TestHysteriaServerAddrIPv6(t *testing.T) {
+	if got := hysteriaServerAddr("2001:db8::1", 443); got != "[2001:db8::1]:443" {
+		t.Fatalf("ipv6: %q", got)
+	}
+	if got := hysteriaServerAddr("example.com", 8443); got != "example.com:8443" {
+		t.Fatalf("dns: %q", got)
+	}
+	if got := hysteriaServerAddr("1.2.3.4", 1234); got != "1.2.3.4:1234" {
+		t.Fatalf("v4: %q", got)
+	}
 }

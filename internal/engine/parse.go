@@ -16,27 +16,27 @@ type ServerSpec struct {
 	Port     int
 
 	// vless / shared
-	UUID       string
-	Flow       string
-	Encryption string // vless user encryption (PQC hybrid) or "none"
-	XPadBytes  string // xhttp padding, e.g. "100-1000"
-	XhttpMode  string // auto | stream-one
-	ExtraRaw   string // raw JSON from ?extra=
-	ALPN       string
-	FragmentRaw string // raw JSON from ?fm=
-	ECH        string // e.g. "ip.gs+udp://8.8.8.8"
-	Security   string // none | tls | reality
-	SNI        string
-	Fingerprint string
-	PBK        string
-	SID        string
-	SPX        string
-	Network    string // tcp | ws | grpc | xhttp
-	Path       string
-	HostHeader string
-	ServiceName string
+	UUID          string
+	Flow          string
+	Encryption    string // vless user encryption (PQC hybrid) or "none"
+	XPadBytes     string // xhttp padding, e.g. "100-1000"
+	XhttpMode     string // auto | stream-one
+	ExtraRaw      string // raw JSON from ?extra=
+	ALPN          string
+	FragmentRaw   string // raw JSON from ?fm=
+	ECH           string // e.g. "ip.gs+udp://8.8.8.8"
+	Security      string // none | tls | reality
+	SNI           string
+	Fingerprint   string
+	PBK           string
+	SID           string
+	SPX           string
+	Network       string // tcp | ws | grpc | xhttp
+	Path          string
+	HostHeader    string
+	ServiceName   string
 	AllowInsecure bool
-	PinnedCert   string // SHA-256 of the leaf cert (set at runtime for insecure=1)
+	PinnedCert    string // SHA-256 of the leaf cert (set at runtime for insecure=1)
 
 	// trojan / ss / hy2
 	Password string
@@ -295,10 +295,11 @@ func parseVmess(line string) *ServerSpec {
 	}
 	s.Host = jsonStrField(jsonStr, "add")
 	s.Port = 443
-	if p := jsonStrField(jsonStr, "port"); p != "" {
-		if n, ok := atoiOK(strings.TrimSpace(p)); ok {
-			s.Port = n
-		}
+	// "port" arrives as a JSON number in most exports (v2rayN, panels) and
+	// as a string in others — accept both, otherwise the port silently
+	// falls back to 443 and the wrong server gets tested
+	if n := jsonIntField(jsonStr, "port"); n > 0 {
+		s.Port = n
 	}
 	s.UUID = jsonStrField(jsonStr, "id")
 	if s.Name == "" {
@@ -433,7 +434,15 @@ func parseSS(line string) *ServerSpec {
 	body := takeNameAndBody(s, line, "ss://")
 	at := strings.LastIndex(body, "@")
 	if at >= 0 {
+		// SIP002: the userinfo is websafe-base64 OR plain percent-encoded
+		// "method:password"; some clients send it fully unencoded. A missing
+		// fallback here dropped the whole config silently.
 		userinfo := b64decode(body[:at])
+		if strings.Index(userinfo, ":") < 0 {
+			if plain := urlDecode(body[:at]); strings.Index(plain, ":") >= 0 {
+				userinfo = plain
+			}
+		}
 		rest := body[at+1:]
 		if qi := strings.Index(rest, "?"); qi >= 0 {
 			rest = rest[:qi]

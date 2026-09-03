@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.0.12"
+	BotVersion = "1.0.13"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -272,7 +272,16 @@ func (b *Bot) onScanRequest(c chat) {
 }
 
 func (b *Bot) onConfigInput(c chat, raw string) {
-	lines := splitConfigLines(raw)
+	// keep only lines that actually parse — the queue count shown to the
+	// user must match what the scan will really test (ParseInput drops
+	// unrecognized lines at run time, which used to cause "5 کانفیگ آماده"
+	// followed by "هیچ خط قابل شناسایی نبود")
+	var lines []string
+	for _, l := range splitConfigLines(raw) {
+		if engine.ParseOne(l) != nil {
+			lines = append(lines, l)
+		}
+	}
 	b.mu.Lock()
 	running := b.running
 	b.mu.Unlock()
@@ -705,6 +714,47 @@ func (b *Bot) onCodesImport(c chat, text string) {
 		b.replyCaptionMenu())
 }
 
+// setEmojiCodeDirect handles the single-line quick setting "DE=5390843037349679256".
+func (b *Bot) setEmojiCodeDirect(c chat, iso, val string) {
+	b.mu.Lock()
+	if b.settings.EmojiCodes == nil {
+		b.settings.EmojiCodes = map[string]string{}
+	}
+	del := strings.EqualFold(val, "delete")
+	if del {
+		delete(b.settings.EmojiCodes, iso)
+	} else {
+		b.settings.EmojiCodes[iso] = val
+	}
+	b.save()
+	b.mu.Unlock()
+	flag := engine.Flag(iso)
+	nm, _ := countries.Names(iso, "fa")
+	var msg string
+	if del {
+		msg = fmt.Sprintf("🗑️ کد ایموجی %s %s (%s) حذف شد.", flag, nm, iso)
+	} else {
+		msg = fmt.Sprintf("✅ کد ایموجی %s %s (%s) ذخیره شد: <code>%s</code>", flag, nm, iso, escapeHTML(val))
+	}
+	_, _ = b.api.sendMessage(c.ID, msg)
+}
+
+// looksLikeCodesList reports whether the text contains at least one
+// "XX=value" line (a batch country-codes import pasted directly).
+func looksLikeCodesList(s string) bool {
+	for _, l := range strings.Split(s, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		kv := strings.SplitN(l, "=", 2)
+		if len(kv) == 2 && len(strings.TrimSpace(kv[0])) == 2 {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Bot) exportCodesText() string {
 	b.mu.Lock()
 	s := b.settingsLocked()
@@ -998,7 +1048,9 @@ func (b *Bot) onAdminRemove(c chat, idStr string) {
 }
 
 func parseID(s string) (int64, bool) {
-	if s == "" {
+	// 19 digits can overflow int64 (max 9223372036854775807) and silently
+	// wrap into a wrong id
+	if s == "" || len(s) > 18 {
 		return 0, false
 	}
 	n := int64(0)
@@ -1076,9 +1128,14 @@ func (b *Bot) handleUpdate(u update) {
 	}
 	if text == "" && m.Document != nil {
 		bb, err := b.api.getFileBytes(m.Document.FileID)
-		if err == nil {
-			text = string(bb)
+		if err != nil {
+			// never echo the raw error — it can contain the bot token inside
+			// the file/download URL
+			_, _ = b.api.sendMessage(c.ID,
+				"⚠️ دریافت فایل ناموفق بود — حجم فایل باید کمتر از ۲۰ مگابایت باشد یا دوباره تلاش کنید.")
+			return
 		}
+		text = string(bb)
 	}
 	if text == "" {
 		_, _ = b.api.sendMessage(c.ID, "لطفاً متن کانفیگ یا فایل .txt ارسال کنید.")
@@ -1087,30 +1144,6 @@ func (b *Bot) handleUpdate(u update) {
 
 	cleanText := strings.TrimSpace(text)
 	lowerText := strings.ToLower(cleanText)
-
-	// Single country code quick setting: "DE=5390843037349679256"
-	if len(cleanText) >= 4 && strings.Contains(cleanText, "=") && !strings.Contains(cleanText, "://") {
-		parts := strings.SplitN(cleanText, "=", 2)
-		iso := strings.ToUpper(strings.TrimSpace(parts[0]))
-		val := strings.TrimSpace(parts[1])
-		if len(iso) == 2 && val != "" {
-			b.mu.Lock()
-			if b.settings.EmojiCodes == nil {
-				b.settings.EmojiCodes = map[string]string{}
-			}
-			if strings.EqualFold(val, "delete") {
-				delete(b.settings.EmojiCodes, iso)
-			} else {
-				b.settings.EmojiCodes[iso] = val
-			}
-			b.save()
-			b.mu.Unlock()
-			flag := engine.Flag(iso)
-			nm, _ := countries.Names(iso, "fa")
-			_, _ = b.api.sendMessage(c.ID, fmt.Sprintf("✅ کد ایموجی %s %s (%s) ذخیره شد: <code>%s</code>", flag, nm, iso, val))
-			return
-		}
-	}
 
 	switch {
 	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو" || cleanText == "↩️ بازگشت به منوی اصلی" || cleanText == "↩️ منوی اصلی":
@@ -1278,6 +1311,26 @@ func (b *Bot) handleUpdate(u update) {
 		return
 	}
 
+	// Country emoji codes: a single line "DE=5390843037349679256" sets one
+	// code directly; a multi-line list is a batch import. This must run AFTER
+	// the awaiting switch (so it never hijacks a prompt like the caption
+	// template) and the multi-line case must be handled as a list — the old
+	// quick-set path swallowed the whole list into ONE country's value.
+	if strings.Contains(cleanText, "=") && !strings.Contains(cleanText, "://") {
+		if !strings.Contains(cleanText, "\n") {
+			parts := strings.SplitN(cleanText, "=", 2)
+			iso := strings.ToUpper(strings.TrimSpace(parts[0]))
+			val := strings.TrimSpace(parts[1])
+			if len(iso) == 2 && val != "" {
+				b.setEmojiCodeDirect(c, iso, val)
+				return
+			}
+		} else if looksLikeCodesList(cleanText) {
+			b.onCodesImport(c, text)
+			return
+		}
+	}
+
 	// Config input
 	t := strings.TrimSpace(text)
 	if strings.Contains(t, "://") {
@@ -1288,27 +1341,59 @@ func (b *Bot) handleUpdate(u update) {
 	b.sendMain(c, "")
 }
 
+// pollState tracks the getUpdates offset across the polling loop.
+type pollState struct {
+	offset  int
+	purging bool
+}
+
+func (p *pollState) next() int { return p.offset + 1 }
+
+// feed handles one getUpdates outcome and returns the updates to process
+// plus a back-off. On Telegram's "start of the range" error the stale range
+// is purged with one huge-offset poll — and the offset is then reset to 0
+// after the clean (empty) reply. The old code kept the huge offset forever,
+// so every later poll matched no update and the bot went deaf until restart.
+func (p *pollState) feed(ups []update, err error) (todo []update, backoff time.Duration) {
+	if err != nil {
+		if strings.Contains(err.Error(), "start of the range") {
+			p.purging = true
+			p.offset = 1 << 60
+			return nil, 0
+		}
+		return nil, 3 * time.Second
+	}
+	if p.purging {
+		p.purging = false
+		if len(ups) == 0 {
+			p.offset = 0
+			return nil, 0
+		}
+	}
+	for _, u := range ups {
+		p.offset = u.UpdateID
+	}
+	return ups, 0
+}
+
 func (b *Bot) Loop() error {
 	name, err := b.getMeName()
 	if err != nil {
 		return err
 	}
 	fmt.Printf("bot started as @%s, owner=%d (v%s)\n", name, b.ownerID, BotVersion)
-	offset := 0
+	var ps pollState
 	for {
-		ups, err := b.api.getUpdates(offset+1, 50)
+		ups, err := b.api.getUpdates(ps.next(), 50)
+		todo, backoff := ps.feed(ups, err)
 		if err != nil {
-			if strings.Contains(err.Error(), "start of the range") {
-				fmt.Println("getUpdates: start of the range - resetting offset to tail")
-				offset = 1 << 60
-				continue
-			}
 			fmt.Println("getUpdates error:", err)
-			time.Sleep(3 * time.Second)
+		}
+		if backoff > 0 {
+			time.Sleep(backoff)
 			continue
 		}
-		for _, u := range ups {
-			offset = u.UpdateID
+		for _, u := range todo {
 			uc := u.chat()
 			if u.Message != nil {
 				fmt.Printf("update %d: chat=%d msg=%q\n",

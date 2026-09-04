@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.1.0"
+	BotVersion = "1.1.1"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -848,9 +848,12 @@ func (b *Bot) importPrompt(c chat) {
 	b.awaiting = awaitCodesImport
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
-		"📥 <b>وارد کردن دسته‌ای کدها</b>\n\n"+
-			"در اپلیکیشن: تب <b>Caption</b> ➔ دکمه‌ی «کپی کدها» ➔ اینجا <b>پیست</b> کنید — یا فایل .txt را بفرستید.\n\n"+
-			"فرمت: هر خط <code>XX=کد</code>، مانند:\n<code>DE=6050626661043411760\nFR=5395616385734833119</code>",
+		"📥 <b>بکاپ کد کشورها</b>\n\n"+
+			"سه راه دارید:\n"+
+			"• فایل بکاپ (از دکمه‌ی «📤 خروجی گرفتن کدها» همین‌جا، یا از اپ) را مستقیم <b>بفرستید</b>.\n"+
+			"• در اپ: تب <b>Caption</b> ➔ «کپی کدها» ➔ اینجا <b>پیست</b> کنید.\n"+
+			"• دستی: هر خط <code>XX=کد</code>، مانند:\n<code>DE=6050626661043411760\nFR=5395616385734833119</code>\n\n"+
+			"فرمت فایل و متن یکی است — بین اپ و ربات به‌هر دو شکل جابه‌جا می‌شود.",
 		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
 
@@ -944,14 +947,22 @@ func (b *Bot) exportCodesText() string {
 	return sb.String()
 }
 
+// onCodesExport sends the codes as a FILE in the exact format the app's
+// «بازیابی از فایل» restores — the same file travels both ways (app ↔ bot).
 func (b *Bot) onCodesExport(c chat) {
 	t := b.exportCodesText()
 	if t == "" {
 		_, _ = b.api.sendWithReplyKeyboard(c.ID, "🤔 هنوز کدی ثبت نشده است.", b.replyCaptionMenu())
 		return
 	}
-	_, _ = b.api.sendMessage(c.ID,
-		"📤 <b>خروجی کدهای ایموجی</b> (فرمت مشترک اپ و ربات):\n\n<pre>"+escapeHTML(t)+"</pre>")
+	fn := "cfgscan_country_codes_" + time.Now().Format("20060102_1504") + ".txt"
+	err := b.api.sendDocument(c.ID, []byte(t), fn,
+		"📤 <b>بکاپ کد کشورها</b> — این فایل را در اپ (تب کپشن ➔ بازیابی از فایل) یا همین‌جا وارد کنید.")
+	if err != nil {
+		// fall back to text if the upload failed
+		_, _ = b.api.sendMessage(c.ID,
+			"📤 <b>خروجی کدهای ایموجی</b> (فرمت مشترک اپ و ربات):\n\n<pre>"+escapeHTML(t)+"</pre>")
+	}
 }
 
 func (b *Bot) setCodePrompt(c chat, iso string) {
@@ -1678,6 +1689,13 @@ func (b *Bot) handleUpdate(u update) {
 		b.awaiting = awaitNone
 		b.mu.Unlock()
 		b.onSetMessageForUsers(c, text)
+		return
+	}
+
+	// A country-codes FILE sent outside the import prompt is a backup
+	// restore as well (app → bot sync).
+	if m.Document != nil && text == "" && looksLikeCodesList(cleanText) {
+		b.onCodesImport(c, cleanText)
 		return
 	}
 

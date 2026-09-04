@@ -413,3 +413,16 @@ func TestAddAdminLegacySync(t *testing.T) {
 		t.Fatalf("v2 list = %d entries", v2)
 	}
 }
+
+// v1.1.1: the codes-file flow — a document sent while awaiting the import
+// prompt restores the codes (app → bot file sync).
+func TestHandleUpdateCodesFileDocument(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.onCodesImport(chat{ID: 1}, "# ConfigScanner country emoji codes\nDE=111\nFR=222\n")
+	b.mu.Lock()
+	de, fr, total := b.settings.EmojiCodes["DE"], b.settings.EmojiCodes["FR"], len(b.settings.EmojiCodes)
+	b.mu.Unlock()
+	if de != "111" || fr != "222" || total != 2 {
+		t.Fatalf("codes-file restore broken: DE=%q FR=%q total=%d", de, fr, total)
+	}
+}

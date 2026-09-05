@@ -276,7 +276,6 @@ func TestAwaitingStateIsPerChat(t *testing.T) {
 	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
 	b.addOrUpdateAdmin(2, PermFull)
 	ca := chat{ID: 1} // owner
-	cb := chat{ID: 2} // second full admin
 
 	// A opens the caption-template prompt
 	b.captionEditPrompt(ca)

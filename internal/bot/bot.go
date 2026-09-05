@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.1.1"
+	BotVersion = "1.1.2"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -103,13 +103,18 @@ type Bot struct {
 	pending    []string // raw config lines awaiting confirmation
 	runMessage int      // progress message id
 	runChat    int64
-	awaiting   awaiting
-	awaitISO   string // target country for awaitCodeSet
-	awaitAdmin int64  // admin id awaiting a permission choice
-
+	// awaiting state is PER-CHAT: a shared field let one admin's prompt
+	// (caption template, code set, …) swallow another admin's next message
+	awaits    map[int64]*awaitState
 	lastCodes []string
 	lastFlags []string
 	lastLog   []string
+}
+
+// awaitState is what one chat is currently waiting for.
+type awaitState struct {
+	kind awaiting
+	iso  string // target country for awaitCodeSet
 }
 
 func NewBot(token string, ownerID int64, dataDir, xrayBin, hyBin string) *Bot {
@@ -125,6 +130,7 @@ func NewBot(token string, ownerID int64, dataDir, xrayBin, hyBin string) *Bot {
 		dataDir: dataDir,
 		xrayBin: xrayBin,
 		hyBin:   hyBin,
+		awaits:  map[int64]*awaitState{},
 	}
 	b.load()
 	return b
@@ -160,6 +166,34 @@ func (b *Bot) save() {
 func (b *Bot) settingsLocked() Settings {
 	b.settings.defaults()
 	return b.settings
+}
+
+// ------------------------------------------------------------------
+// per-chat awaiting state (caller must hold b.mu)
+
+func (b *Bot) setAwaitLocked(chatID int64, kind awaiting, iso string) {
+	b.awaits[chatID] = &awaitState{kind: kind, iso: iso}
+}
+
+func (b *Bot) clearAwaitLocked(chatID int64) {
+	delete(b.awaits, chatID)
+}
+
+// awaitKindLocked returns what this chat is waiting for (awaitNone if nothing).
+func (b *Bot) awaitKindLocked(chatID int64) awaiting {
+	st, ok := b.awaits[chatID]
+	if !ok {
+		return awaitNone
+	}
+	return st.kind
+}
+
+func (b *Bot) awaitISOLocked(chatID int64) string {
+	st, ok := b.awaits[chatID]
+	if !ok {
+		return ""
+	}
+	return st.iso
 }
 
 // ------------------------------------------------------------------
@@ -416,9 +450,7 @@ func (b *Bot) sendMain(c chat, intro string) {
 		intro = b.mainIntro()
 	}
 	b.mu.Lock()
-	b.awaiting = awaitNone
-	b.awaitISO = ""
-	b.awaitAdmin = 0
+	b.clearAwaitLocked(c.ID)
 	p := len(b.pending)
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID, intro, b.replyMainMenuFor(c.ID, p))
@@ -736,8 +768,7 @@ func (b *Bot) sendRunLog(c chat) {
 
 func (b *Bot) showCaptionMenu(c chat) {
 	b.mu.Lock()
-	b.awaiting = awaitNone
-	b.awaitISO = ""
+	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"🏷️ <b>کپشن و پرچم</b>\n\n"+
@@ -751,7 +782,7 @@ func (b *Bot) showCaptionMenu(c chat) {
 func (b *Bot) captionEditPrompt(c chat) {
 	b.mu.Lock()
 	s := b.settingsLocked()
-	b.awaiting = awaitCaptionTemplate
+	b.setAwaitLocked(c.ID, awaitCaptionTemplate, "")
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"✏️ <b>ویرایش قالب کپشن</b>\n\n"+
@@ -845,7 +876,7 @@ func (b *Bot) onCodesMenu(c chat) {
 
 func (b *Bot) importPrompt(c chat) {
 	b.mu.Lock()
-	b.awaiting = awaitCodesImport
+	b.setAwaitLocked(c.ID, awaitCodesImport, "")
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"📥 <b>بکاپ کد کشورها</b>\n\n"+
@@ -968,8 +999,7 @@ func (b *Bot) onCodesExport(c chat) {
 func (b *Bot) setCodePrompt(c chat, iso string) {
 	iso = strings.ToUpper(strings.TrimSpace(iso))
 	b.mu.Lock()
-	b.awaiting = awaitCodeSet
-	b.awaitISO = iso
+	b.setAwaitLocked(c.ID, awaitCodeSet, iso)
 	b.mu.Unlock()
 
 	flag := engine.Flag(iso)
@@ -1013,8 +1043,7 @@ func (b *Bot) onSetCode(c chat, iso, text string) {
 
 func (b *Bot) showMsgForUsersMenu(c chat) {
 	b.mu.Lock()
-	b.awaiting = awaitNone
-	b.awaitISO = ""
+	b.clearAwaitLocked(c.ID)
 	s := b.settingsLocked()
 	b.mu.Unlock()
 
@@ -1031,7 +1060,7 @@ func (b *Bot) showMsgForUsersMenu(c chat) {
 
 func (b *Bot) msgForUsersPrompt(c chat) {
 	b.mu.Lock()
-	b.awaiting = awaitMessageForUsers
+	b.setAwaitLocked(c.ID, awaitMessageForUsers, "")
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"✏️ <b>تنظیم متن پیام برای کاربران</b>\n\n"+
@@ -1068,8 +1097,7 @@ var (
 
 func (b *Bot) showSettingsMenu(c chat) {
 	b.mu.Lock()
-	b.awaiting = awaitNone
-	b.awaitISO = ""
+	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"⚙️ <b>تنظیمات ربات</b>\n\n"+
@@ -1111,7 +1139,7 @@ func (b *Bot) cycleSetting(c chat, key string) {
 
 func (b *Bot) channelNamePrompt(c chat) {
 	b.mu.Lock()
-	b.awaiting = awaitChannelName
+	b.setAwaitLocked(c.ID, awaitChannelName, "")
 	s := b.settingsLocked()
 	b.mu.Unlock()
 	cur := s.Channel
@@ -1164,7 +1192,7 @@ func (b *Bot) adminAddPrompt(c chat) {
 		return
 	}
 	b.mu.Lock()
-	b.awaiting = awaitAdminAdd
+	b.setAwaitLocked(c.ID, awaitAdminAdd, "")
 	b.mu.Unlock()
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"➕ <b>افزودن ادمین جدید</b>\n\n"+
@@ -1194,16 +1222,14 @@ func (b *Bot) onAdminAdd(c chat, text string) {
 		return
 	}
 	if ex, has := b.adminUserLocked(id); has {
-		b.awaiting = awaitNone
-		b.awaitAdmin = id
+		b.clearAwaitLocked(c.ID)
 		b.mu.Unlock()
 		_, _ = b.api.sendWithKeyboard(c.ID,
 			fmt.Sprintf("این کاربر از قبل با سطح %s ثبت شده — سطح جدید را انتخاب کنید:", adminPermLabel(ex.Perm)),
 			permPickerRows(id), "sendMessage")
 		return
 	}
-	b.awaiting = awaitNone
-	b.awaitAdmin = id
+	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
 	_, _ = b.api.sendWithKeyboard(c.ID,
 		fmt.Sprintf("✏️ سطح دسترسی ادمین <code>%d</code> را انتخاب کنید:", id),
@@ -1266,9 +1292,7 @@ func (b *Bot) routeScanOnly(c chat, cleanText, lowerText string) {
 		_, _ = b.api.sendMessage(c.ID, fmt.Sprintf("ID شما: <code>%d</code>", c.ID))
 	case lowerText == "/cancel" || cleanText == "لغو":
 		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.awaitAdmin = 0
+		b.clearAwaitLocked(c.ID)
 		b.pending = nil
 		b.mu.Unlock()
 		b.sendMain(c, "✖️ عملیات لغو شد.")
@@ -1398,9 +1422,10 @@ func (b *Bot) settingsSummaryText() string {
 }
 
 func parseID(s string) (int64, bool) {
-	// 19 digits can overflow int64 (max 9223372036854775807) and silently
-	// wrap into a wrong id
-	if s == "" || len(s) > 18 {
+	// 19 digits can overflow int64 (max 9223372036854775807); Telegram ids
+	// also never start with a zero — a leading zero silently produced a
+	// WRONG id (0123 became 123)
+	if s == "" || len(s) > 18 || s[0] == '0' {
 		return 0, false
 	}
 	n := int64(0)
@@ -1409,6 +1434,9 @@ func parseID(s string) (int64, bool) {
 			return 0, false
 		}
 		n = n*10 + int64(ch-'0')
+	}
+	if n <= 0 {
+		return 0, false
 	}
 	return n, true
 }
@@ -1622,31 +1650,27 @@ func (b *Bot) handleUpdate(u update) {
 		return
 	case lowerText == "/cancel" || cleanText == "لغو":
 		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.awaitAdmin = 0
+		b.clearAwaitLocked(c.ID)
 		b.pending = nil
 		b.mu.Unlock()
 		b.sendMain(c, "✖️ عملیات لغو شد.")
-		return
 	}
 
-	// Awaiting state
+	// Awaiting state (per-chat)
 	b.mu.Lock()
-	aw := b.awaiting
-	iso := b.awaitISO
+	aw := b.awaitKindLocked(c.ID)
+	iso := b.awaitISOLocked(c.ID)
+	if aw != awaitNone {
+		b.clearAwaitLocked(c.ID)
+	}
 	b.mu.Unlock()
 
 	switch aw {
 	case awaitCaptionTemplate:
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.mu.Unlock()
 		b.onCaptionTemplate(c, text)
 		return
 	case awaitChannelName:
 		b.mu.Lock()
-		b.awaiting = awaitNone
 		name := strings.TrimSpace(strings.TrimPrefix(text, "@"))
 		if name == "" || strings.EqualFold(name, "delete") {
 			b.settings.Channel = ""
@@ -1666,28 +1690,15 @@ func (b *Bot) handleUpdate(u update) {
 		b.broadcastSettings(c.ID)
 		return
 	case awaitAdminAdd:
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.mu.Unlock()
 		b.onAdminAdd(c, text)
 		return
 	case awaitCodesImport:
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.mu.Unlock()
 		b.onCodesImport(c, text)
 		return
 	case awaitCodeSet:
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.awaitISO = ""
-		b.mu.Unlock()
 		b.onSetCode(c, iso, text)
 		return
 	case awaitMessageForUsers:
-		b.mu.Lock()
-		b.awaiting = awaitNone
-		b.mu.Unlock()
 		b.onSetMessageForUsers(c, text)
 		return
 	}
@@ -1796,10 +1807,13 @@ func (b *Bot) Loop() error {
 }
 
 func clip(s string, n int) string {
-	if len(s) <= n {
+	// clip on RUNE boundaries, not bytes — byte slicing cut Persian text
+	// and emojis in half and printed garbage to the log
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(r[:n]) + "…"
 }
 
 func (b *Bot) getMeName() (string, error) {

@@ -248,11 +248,75 @@ func TestParseIDRejectsOverflow(t *testing.T) {
 	if _, ok := parseID("123456789012345678901234567890"); ok {
 		t.Fatal("30 digits must be rejected (int64 overflow)")
 	}
+	if _, ok := parseID("1234567890123456789"); ok {
+		t.Fatal("19 digits must be rejected (int64 overflow risk)")
+	}
 	if id, ok := parseID("123456789"); !ok || id != 123456789 {
 		t.Fatalf("normal id broken: %d %v", id, ok)
 	}
 	if _, ok := parseID(""); ok {
 		t.Fatal("empty must be rejected")
+	}
+	if _, ok := parseID("0"); ok {
+		t.Fatal("zero must be rejected")
+	}
+	// leading zeros produce a WRONG id (0123 -> 123) — must be rejected
+	if _, ok := parseID("0123"); ok {
+		t.Fatal("leading-zero id must be rejected")
+	}
+	if _, ok := parseID("12a4"); ok {
+		t.Fatal("non-digit id must be rejected")
+	}
+}
+
+// v1.1.2: the awaiting state used to be ONE shared field for the whole bot —
+// when admin A opened a prompt (e.g. caption template) and admin B sent a
+// plain message in between, B's text was swallowed as A's answer.
+func TestAwaitingStateIsPerChat(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.addOrUpdateAdmin(2, PermFull)
+	ca := chat{ID: 1} // owner
+	cb := chat{ID: 2} // second full admin
+
+	// A opens the caption-template prompt
+	b.captionEditPrompt(ca)
+	b.mu.Lock()
+	ka := b.awaitKindLocked(1)
+	kb := b.awaitKindLocked(2)
+	b.mu.Unlock()
+	if ka != awaitCaptionTemplate {
+		t.Fatalf("chat A not awaiting: %d", ka)
+	}
+	if kb != awaitNone {
+		t.Fatalf("chat B must not be awaiting: %d", kb)
+	}
+
+	// B sends an unrelated message — it must NOT consume A's prompt
+	var u update
+	if err := json.Unmarshal([]byte(`{"update_id":9,"message":{"message_id":9,"chat":{"id":2},"text":"hello"}}`), &u); err != nil {
+		t.Fatal(err)
+	}
+	b.handleUpdate(u)
+	b.mu.Lock()
+	ka2 := b.awaitKindLocked(1)
+	tpl := b.settings.CaptionTemplate
+	b.mu.Unlock()
+	if ka2 != awaitCaptionTemplate {
+		t.Fatal("B's message cleared A's awaiting state")
+	}
+	if tpl != DefaultCaptionTemplate {
+		t.Fatalf("B's 'hello' was saved as the caption template: %q", tpl)
+	}
+
+	// A's answer still works
+	var u2 update
+	if err := json.Unmarshal([]byte(`{"update_id":10,"message":{"message_id":10,"chat":{"id":1},"text":"tpl {{FLAGS}}"}}`), &u2); err != nil {
+		t.Fatal(err)
+	}
+	b.handleUpdate(u2)
+	s := b.settingsLocked()
+	if s.CaptionTemplate != "tpl {{FLAGS}}" {
+		t.Fatalf("A's answer was lost: %q", s.CaptionTemplate)
 	}
 }
 
@@ -365,7 +429,7 @@ func TestRouteScanOnly(t *testing.T) {
 
 	b.routeScanOnly(c, "⚙️ تنظیمات", "⚙️ تنظیمات") // must NOT open settings
 	b.mu.Lock()
-	aw := b.awaiting
+	aw := b.awaitKindLocked(77)
 	b.mu.Unlock()
 	if aw != awaitNone {
 		t.Fatal("scan admin reached an awaiting state")
@@ -414,7 +478,21 @@ func TestAddAdminLegacySync(t *testing.T) {
 	}
 }
 
-// v1.1.1: the codes-file flow — a document sent while awaiting the import
+// v1.1.2: clip used BYTE slicing — Persian/emoji text got cut mid-rune and
+// the log printed garbage.
+func TestClipIsRuneSafe(t *testing.T) {
+	in := strings.Repeat("آ", 100) + "🇩🇪"
+	out := clip(in, 60)
+	if strings.Contains(out, "\uFFFD") {
+		t.Fatal("clip produced a broken rune")
+	}
+	// byte-slicing would have produced MORE bytes than 61 runes can hold
+	if rn := len([]rune(out)); rn != 61 { // 60 runes + the ellipsis
+		t.Fatalf("clip length = %d runes, want 61", rn)
+	}
+}
+
+// v1.1.2: the codes-file flow — a document sent while awaiting the import
 // prompt restores the codes (app → bot file sync).
 func TestHandleUpdateCodesFileDocument(t *testing.T) {
 	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")

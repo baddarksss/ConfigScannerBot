@@ -343,7 +343,8 @@ func (e *Engine) testOne(s *ServerSpec, port int) (string, int, string) {
 	// like the app. All other protocols use Xray.
 	cmd, engineLog, cfgFile := startEngineFor(s, cfg, port)
 	if cmd == nil {
-		return "❌ " + base + " — engine start error", kFail, ""
+		cfg.Logf("test: " + hostport + " engine failed to start")
+		return "❌ " + base + " — " + failMsg(cfg.OutLang, "engine"), kFail, ""
 	}
 	defer func() {
 		_ = cmd.Process.Kill()
@@ -437,11 +438,15 @@ func failMsg(lang, kind string) string {
 		switch kind {
 		case "connect":
 			return "اتصال برقرار نشد"
+		case "engine":
+			return "خطای موتور اسکن — راه‌اندازی ناموفق"
 		}
 	}
 	switch kind {
 	case "connect":
 		return "connection failed"
+	case "engine":
+		return "engine failed to start"
 	}
 	return "failed"
 }

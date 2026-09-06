@@ -303,12 +303,25 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 
 // FilterLinksByCountries keeps only links whose country is in the set.
 // A nil/empty set keeps everything (unknown-country links included).
+// When "" is kept, unknown-country links are appended to Links (unless
+// they are already in it via IncludeUnknown).
 func (r *RunResult) FilterLinksByCountries(keep map[string]bool) {
 	if len(keep) == 0 {
 		return
 	}
-	r.Links = filterCountryLines(r.Links, keep)
-	// unknown-country links survive only when "" is explicitly kept
+	links := filterCountryLines(r.Links, keep)
+	if keep[""] && len(r.UnknownLinks) > 0 {
+		seen := make(map[string]bool, len(links))
+		for _, l := range links {
+			seen[l] = true
+		}
+		for _, l := range r.UnknownLinks {
+			if !seen[l] {
+				links = append(links, l)
+			}
+		}
+	}
+	r.Links = links
 	r.UnknownLinks = filterCountryLines(r.UnknownLinks, keep)
 }
 
@@ -317,12 +330,15 @@ func (r *RunResult) FilterLinksByCountries(keep map[string]bool) {
 func filterCountryLines(lines []string, keep map[string]bool) []string {
 	var out []string
 	for _, l := range lines {
-		if iso, flagged := isoOfLine(l); flagged {
+		iso, hasNoFlag := isoOfLine(l)
+		if !hasNoFlag {
+			// the line is labeled with a country flag
 			if keep[iso] {
 				out = append(out, l)
 			}
 			continue
 		}
+		// no flag: an unknown-country line — keep only if "" was selected
 		if keep[""] {
 			out = append(out, l)
 		}
@@ -333,7 +349,7 @@ func filterCountryLines(lines []string, keep map[string]bool) []string {
 // isoOfLine extracts the ISO code a renamed link was labeled with: the
 // label starts with the flag emoji of that country (🇩🇪 …). Returns
 // ("", true) when the line carries no flag.
-func isoOfLine(line string) (string, bool) {
+func isoOfLine(line string) (iso string, hasNoFlag bool) {
 	i := strings.IndexFunc(line, func(r rune) bool { return r >= 0x1F1E6 && r <= 0x1F1FF })
 	if i < 0 {
 		return "", true // no flag on this line

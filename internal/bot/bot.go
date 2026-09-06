@@ -784,6 +784,12 @@ func (b *Bot) outCountriesMenu(chatID int64) {
 	if len(currentRow) > 0 {
 		rows = append(rows, currentRow)
 	}
+	// unknown-country servers toggle ("" key)
+	unkMark := "·"
+	if sel[""] {
+		unkMark = "✅"
+	}
+	rows = append(rows, []string{unkMark + " ❓ نامشخص", "outsel:"})
 	rows = append(rows,
 		[]string{"✅ اعمال فیلتر", "outapply:", "♻️ همه کشورها", "outapply:all"},
 		[]string{"↩️ منوی اصلی", "menu:back"})

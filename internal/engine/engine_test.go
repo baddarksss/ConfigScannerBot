@@ -276,18 +276,32 @@ func TestCountryCountsAndFilter(t *testing.T) {
 			t.Fatalf("filter kept a non-DE link: %s", l)
 		}
 	}
+
+	// keeping the unknown ("") pulls unknown links in from UnknownLinks
+	res.UnknownLinks = []string{"vless://d@4.4.4.4:443#unknown"}
+	filteredU := &RunResult{}
+	*filteredU = *res
+	filteredU.Links = res.Links[:3] // unknown excluded from Links
+	filteredU.FilterLinksByCountries(map[string]bool{"DE": true, "": true})
+	if len(filteredU.Links) != 3 {
+		t.Fatalf("DE+unknown filter kept %d links: %v", len(filteredU.Links), filteredU.Links)
+	}
+	joined := strings.Join(filteredU.Links, "\n")
+	if !strings.Contains(joined, "unknown") {
+		t.Fatal("unknown link lost even though \"\" was kept")
+	}
 }
 
 func TestIsoOfLine(t *testing.T) {
 	// renamed links carry the raw flag emoji in the fragment (EncodeFragment
 	// percent-encodes only spaces/controls)
-	if iso, flagged := isoOfLine("vless://a@1.1.1.1:443#🇩🇪%20Germany"); !flagged || iso != "DE" {
-		t.Fatalf("flagged link: %q %v", iso, flagged)
+	if iso, noFlag := isoOfLine("vless://a@1.1.1.1:443#🇩🇪%20Germany"); noFlag || iso != "DE" {
+		t.Fatalf("flagged link: %q %v", iso, noFlag)
 	}
-	if iso, flagged := isoOfLine("trojan://x@2.2.2.2:443#🇫🇷 France"); !flagged || iso != "FR" {
-		t.Fatalf("french link: %q %v", iso, flagged)
+	if iso, noFlag := isoOfLine("trojan://x@2.2.2.2:443#🇫🇷 France"); noFlag || iso != "FR" {
+		t.Fatalf("french link: %q %v", iso, noFlag)
 	}
-	if _, flagged := isoOfLine("vless://a@1.1.1.1:443#plain-name"); !flagged {
+	if _, noFlag := isoOfLine("vless://a@1.1.1.1:443#plain-name"); !noFlag {
 		t.Fatal("plain link must be reported as not flagged")
 	}
 }

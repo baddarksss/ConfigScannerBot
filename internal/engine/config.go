@@ -234,15 +234,14 @@ func buildStreamSettings(s *ServerSpec) (map[string]any, error) {
 					t["alpn"] = a
 				}
 			}
-			// ECH: panels send a resolver hint (ip.gs+udp://…); xray 26.x
-			// "half" = resolve the ECH config itself when advertised
+			// ECH: panels send a resolver hint (ip.gs+udp://8.8.8.8).
+			// xray's TlsConfig has NO echForceQuery/echConfig keys — those were
+			// silently ignored, so ECH never actually applied (app parity, v1.0.49).
+			// The only client-side knob is echConfigList (transport_security.go):
+			// a value containing "://" is xray's DNS-resolver form ("name+url")
+			// and xray queries the ECHConfig itself (tls/ech.go).
 			if s.ECH != "" {
-				t["echForceQuery"] = "half"
-				if len(s.ECH) > 25 && !strings.Contains(s.ECH, "/") &&
-					!strings.Contains(s.ECH, "+") && !strings.Contains(s.ECH, ":") &&
-					!strings.Contains(s.ECH, "?") {
-					t["echConfig"] = s.ECH
-				}
+				t["echConfigList"] = s.ECH
 			}
 			// self-signed / insecure=1: pin the leaf cert fetched at test start
 			if s.PinnedCert != "" {

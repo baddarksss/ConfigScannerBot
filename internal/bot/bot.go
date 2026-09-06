@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.0"
+	BotVersion = "1.2.1"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -742,7 +742,7 @@ func (b *Bot) startRun(c chat) {
 			}, "sendMessage")
 	}
 
-	b.finishRunGuard();
+	b.finishRunGuard()
 	b.sendMain(c, "✅ <b>پایان اسکن.</b> برای اسکن بعدی کانفیگ‌ها را بفرستید یا از منو انتخاب کنید:")
 }
 

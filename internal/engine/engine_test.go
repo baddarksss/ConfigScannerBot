@@ -155,6 +155,14 @@ func TestOutboundOrderAndDNS(t *testing.T) {
 	if !strings.Contains(cfgStr, `"udp://8.8.8.8"`) {
 		t.Fatal("ECH DNS resolver missing in dns section")
 	}
+	// v1.2.1 (app parity): the ECH hint must land in echConfigList — the old
+	// echForceQuery/echConfig keys do not exist in xray and were ignored
+	if !strings.Contains(cfgStr, `"echConfigList":"ip.gs+udp://8.8.8.8"`) {
+		t.Fatal("echConfigList missing in tlsSettings")
+	}
+	if strings.Contains(cfgStr, "echForceQuery") || strings.Contains(cfgStr, `"echConfig":`) {
+		t.Fatal("removed/invalid ECH keys are back")
+	}
 }
 
 func TestGetEchDnsResolver(t *testing.T) {

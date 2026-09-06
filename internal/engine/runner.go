@@ -362,7 +362,7 @@ func isoOfLine(line string) (iso string, hasNoFlag bool) {
 	if c1 < 0x1F1E6 || c1 > 0x1F1FF || c2 < 0x1F1E6 || c2 > 0x1F1FF {
 		return "", true
 	}
-	return string(rune('A' + c1 - 0x1F1E6)) + string(rune('A' + c2 - 0x1F1E6)), false
+	return string(rune('A'+c1-0x1F1E6)) + string(rune('A'+c2-0x1F1E6)), false
 }
 
 // LimitLinks randomly keeps at most n links (order preserved). n<=0 keeps all.

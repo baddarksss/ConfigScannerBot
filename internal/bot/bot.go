@@ -693,7 +693,8 @@ func (b *Bot) startRun(c chat) {
 				missing = append(missing, iso)
 			}
 		}
-	}	if len(missing) > 0 {
+	}
+	if len(missing) > 0 {
 		var lines []string
 		var btnRows [][]string
 		var currentRow []string

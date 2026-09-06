@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.1.2"
+	BotVersion = "1.2.0"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -88,6 +88,7 @@ const (
 	awaitCodesImport
 	awaitCodeSet
 	awaitMessageForUsers
+	awaitOutLimit
 )
 
 type Bot struct {
@@ -109,6 +110,11 @@ type Bot struct {
 	lastCodes []string
 	lastFlags []string
 	lastLog   []string
+
+	// last run's result, kept for the output tools (country filter / limit)
+	lastResult *engine.RunResult
+	// per-chat pending country selection for the output filter
+	outSel map[int64]map[string]bool
 }
 
 // awaitState is what one chat is currently waiting for.
@@ -634,6 +640,13 @@ func (b *Bot) startRun(c chat) {
 		len(res.CountryCodes), cfg.Parallel, cfg.TimeoutSec)
 	_, _ = b.api.sendMessage(chatID, summaryMsg)
 
+	// 1b) Per-country live-server counts (flag + name × n)
+	if line := res.CountsLine(cfg.OutLang); line != "" {
+		if fitsMsg(line) {
+			_, _ = b.api.sendMessage(chatID, "🌍 <b>سرورهای سالم بر اساس کشور:</b>\n\n"+line)
+		}
+	}
+
 	// 2) Working links only (clean output in <pre> or .txt file)
 	if len(res.Links) > 0 {
 		linksBody := strings.Join(res.Links, "\n")
@@ -680,8 +693,7 @@ func (b *Bot) startRun(c chat) {
 				missing = append(missing, iso)
 			}
 		}
-	}
-	if len(missing) > 0 {
+	}	if len(missing) > 0 {
 		var lines []string
 		var btnRows [][]string
 		var currentRow []string
@@ -713,8 +725,173 @@ func (b *Bot) startRun(c chat) {
 		_, _ = b.api.sendWithKeyboard(chatID, msg, btnRows, "sendMessage")
 	}
 
-	b.finishRunGuard()
+	// 7) Output tools: keep the run result for the country filter / limit
+	if len(res.Links) > 0 || len(res.UnknownLinks) > 0 {
+		b.mu.Lock()
+		b.lastResult = res
+		b.mu.Unlock()
+		_, _ = b.api.sendWithKeyboard(chatID,
+			"🧰 <b>ابزار خروجی</b>\n\n"+
+				"• <b>فیلتر کشور</b>: فقط کشورهای انتخابی در خروجی می‌مانند\n"+
+				"• <b>محدودیت تعداد</b>: فقط N سرور به‌صورت تصادفی از سالم‌ها\n"+
+				"• خروجی (فایل configs.txt) از فیلترها پیروی می‌کند",
+			[][]string{
+				{"🌍 فیلتر کشور", "out:countries", "🔢 محدودیت تعداد", "out:limit"},
+				{"📥 خروجی فایل", "out:file"},
+			}, "sendMessage")
+	}
+
+	b.finishRunGuard();
 	b.sendMain(c, "✅ <b>پایان اسکن.</b> برای اسکن بعدی کانفیگ‌ها را بفرستید یا از منو انتخاب کنید:")
+}
+
+// ------------------------------------------------------------------
+// output tools (country filter / count limit) on the last run
+
+// outCountriesMenu shows one toggle button per country; a ✅ prefix marks the
+// currently selected ones. «اعمال فیلتر» applies and sends the filtered file.
+func (b *Bot) outCountriesMenu(chatID int64) {
+	b.mu.Lock()
+	res := b.lastResult
+	sel := b.outSel[chatID]
+	lang := b.settingsLocked().OutLang
+	b.mu.Unlock()
+	if res == nil || len(res.CountryCounts) == 0 {
+		_, _ = b.api.sendMessage(chatID, "🤔 اول یه اسکن انجام بده که خروجی داشته باشیم.")
+		return
+	}
+	var rows [][]string
+	var currentRow []string
+	for _, iso := range res.CountryCodes {
+		n, ok := res.CountryCounts[iso]
+		if !ok || n == 0 {
+			continue
+		}
+		nm, _ := countries.Names(iso, lang)
+		mark := "·"
+		if sel[iso] {
+			mark = "✅"
+		}
+		currentRow = append(currentRow,
+			fmt.Sprintf("%s %s %s (%d)", mark, engine.Flag(iso), nm, n),
+			"outsel:"+iso)
+		if len(currentRow) == 4 { // 2 buttons per row
+			rows = append(rows, currentRow)
+			currentRow = nil
+		}
+	}
+	if len(currentRow) > 0 {
+		rows = append(rows, currentRow)
+	}
+	rows = append(rows,
+		[]string{"✅ اعمال فیلتر", "outapply:", "♻️ همه کشورها", "outapply:all"},
+		[]string{"↩️ منوی اصلی", "menu:back"})
+	_, _ = b.api.sendWithKeyboard(chatID,
+		"🌍 <b>فیلتر کشور</b>\n\nروی هر کشور بزن تا انتخاب/حذف بشه، بعد «اعمال فیلتر» را بزن. خروجی و فایل فقط کشورهای انتخابی را می‌گیرند.",
+		rows, "sendMessage")
+}
+
+// outCountriesSelect toggles one country in the chat's pending selection and
+// refreshes the menu with the new marks.
+func (b *Bot) outCountriesSelect(chatID int64, iso string) {
+	b.mu.Lock()
+	if b.outSel == nil {
+		b.outSel = map[int64]map[string]bool{}
+	}
+	if b.outSel[chatID] == nil {
+		b.outSel[chatID] = map[string]bool{}
+	}
+	if b.outSel[chatID][iso] {
+		delete(b.outSel[chatID], iso)
+	} else {
+		b.outSel[chatID][iso] = true
+	}
+	b.mu.Unlock()
+	b.outCountriesMenu(chatID)
+}
+
+// outCountriesApply sends the filtered links file.
+func (b *Bot) outCountriesApply(chatID int64, all bool) {
+	b.mu.Lock()
+	res := b.lastResult
+	sel := b.outSel[chatID]
+	b.outSel[chatID] = nil
+	b.mu.Unlock()
+	if res == nil {
+		_, _ = b.api.sendMessage(chatID, "🤔 اسکنی برای فیلتر کردن نیست.")
+		return
+	}
+	if all || len(sel) == 0 {
+		b.sendOutFile(chatID, res, "همه کشورها")
+		return
+	}
+	filtered := &engine.RunResult{}
+	*filtered = *res
+	filtered.FilterLinksByCountries(sel)
+	if len(filtered.Links) == 0 {
+		_, _ = b.api.sendMessage(chatID, "🤔 با این انتخاب هیچ لینکی باقی نماند.")
+		return
+	}
+	b.sendOutFile(chatID, filtered, fmt.Sprintf("%d کشور", len(sel)))
+}
+
+// outLimitFlow asks for the count and keeps N random links.
+func (b *Bot) outLimitFlow(chatID int64) {
+	b.mu.Lock()
+	res := b.lastResult
+	b.mu.Unlock()
+	if res == nil || len(res.Links) == 0 {
+		_, _ = b.api.sendMessage(chatID, "🤔 اول یه اسکن انجام بده که خروجی داشته باشیم.")
+		return
+	}
+	total := len(res.Links)
+	_, _ = b.api.sendMessage(chatID, fmt.Sprintf(
+		"🔢 <b>محدودیت تعداد</b>\n\nهم‌اکنون <b>%d</b> لینک سالم داری. عدد دلخواهت را بفرست تا همان‌قدر (تصادفی) نگه داشته شود:", total))
+	b.mu.Lock()
+	b.setAwaitLocked(chatID, awaitOutLimit, "")
+	b.mu.Unlock()
+}
+
+// onOutLimit handles the numeric answer of the limit prompt.
+func (b *Bot) onOutLimit(chatID int64, text string) {
+	b.mu.Lock()
+	res := b.lastResult
+	b.mu.Unlock()
+	if res == nil || len(res.Links) == 0 {
+		_, _ = b.api.sendMessage(chatID, "🤔 اسکنی در دسترس نیست.")
+		return
+	}
+	n := 0
+	for _, ch := range strings.TrimSpace(text) {
+		if ch < '0' || ch > '9' {
+			_, _ = b.api.sendMessage(chatID, "🤔 فقط یک عدد بفرست.")
+			return
+		}
+		n = n*10 + int(ch-'0')
+	}
+	if n <= 0 || n > len(res.Links) {
+		_, _ = b.api.sendMessage(chatID, fmt.Sprintf("🤔 عددی بین ۱ تا %d بفرست.", len(res.Links)))
+		return
+	}
+	limited := &engine.RunResult{}
+	*limited = *res
+	limited.LimitLinks(n)
+	b.sendOutFile(chatID, limited, fmt.Sprintf("%d لینک تصادفی", n))
+}
+
+// sendOutFile delivers the (possibly filtered) links as text or document.
+func (b *Bot) sendOutFile(chatID int64, res *engine.RunResult, what string) {
+	if len(res.Links) == 0 {
+		_, _ = b.api.sendMessage(chatID, "❌ با این فیلتر هیچ لینکی باقی نماند.")
+		return
+	}
+	body := strings.Join(res.Links, "\n")
+	docCap := fmt.Sprintf("🔗 %s — %d لینک", what, len(res.Links))
+	if fitsMsg(body) {
+		_, _ = b.api.sendMessage(chatID, "<pre>"+escapeHTML(body)+"</pre>")
+		return
+	}
+	_ = b.api.sendDocument(chatID, []byte(body), "configs.txt", docCap)
 }
 
 func fitsMsg(s string) bool {
@@ -1515,6 +1692,35 @@ func (b *Bot) handleUpdate(u update) {
 			b.importPrompt(c)
 			return
 		}
+
+		// ---- output tools (country filter / limit / file) ----
+		var cbChat int64
+		if cq.Message != nil && cq.Message.Chat != nil {
+			cbChat = cq.Message.Chat.ID
+		} else {
+			cbChat = cq.From.ID
+		}
+		switch {
+		case data == "out:countries":
+			b.outCountriesMenu(cbChat)
+		case data == "out:limit":
+			b.outLimitFlow(cbChat)
+		case data == "out:file":
+			b.mu.Lock()
+			res := b.lastResult
+			b.mu.Unlock()
+			if res != nil {
+				b.sendOutFile(cbChat, res, "همه")
+			}
+		case strings.HasPrefix(data, "outsel:"):
+			b.outCountriesSelect(cbChat, strings.TrimPrefix(data, "outsel:"))
+		case data == "outapply:":
+			b.outCountriesApply(cbChat, false)
+		case data == "outapply:all":
+			b.outCountriesApply(cbChat, true)
+		case data == "menu:back":
+			b.sendMain(chat{ID: cbChat}, "")
+		}
 		return
 	}
 
@@ -1700,6 +1906,9 @@ func (b *Bot) handleUpdate(u update) {
 		return
 	case awaitMessageForUsers:
 		b.onSetMessageForUsers(c, text)
+		return
+	case awaitOutLimit:
+		b.onOutLimit(c.ID, text)
 		return
 	}
 

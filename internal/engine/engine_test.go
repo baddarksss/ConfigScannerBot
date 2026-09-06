@@ -247,3 +247,74 @@ func TestHysteriaServerAddrIPv6(t *testing.T) {
 		t.Fatalf("v4: %q", got)
 	}
 }
+
+// v1.2.0: per-country counts, country filtering and the random limit.
+func TestCountryCountsAndFilter(t *testing.T) {
+	res := &RunResult{
+		Links: []string{
+			"vless://a@1.1.1.1:443#🇩🇪%20Germany",
+			"vless://b@2.2.2.2:443#🇩🇪%20Germany",
+			"vless://c@3.3.3.3:443#🇫🇷%20France",
+			"vless://d@4.4.4.4:443#unknown",
+		},
+		CountryCodes:  []string{"DE", "FR"},
+		CountryCounts: map[string]int{"DE": 2, "FR": 1},
+	}
+	if got := res.CountsLine("en"); !strings.Contains(got, "🇩🇪 Germany × 2") || !strings.Contains(got, "🇫🇷 France × 1") {
+		t.Fatalf("counts line: %q", got)
+	}
+
+	// keep only DE — the flag emoji marks the country on renamed links
+	filtered := &RunResult{}
+	*filtered = *res
+	filtered.FilterLinksByCountries(map[string]bool{"DE": true})
+	if len(filtered.Links) != 2 {
+		t.Fatalf("DE filter kept %d links: %v", len(filtered.Links), filtered.Links)
+	}
+	for _, l := range filtered.Links {
+		if strings.Contains(l, "France") || strings.Contains(l, "unknown") {
+			t.Fatalf("filter kept a non-DE link: %s", l)
+		}
+	}
+}
+
+func TestIsoOfLine(t *testing.T) {
+	// renamed links carry the raw flag emoji in the fragment (EncodeFragment
+	// percent-encodes only spaces/controls)
+	if iso, flagged := isoOfLine("vless://a@1.1.1.1:443#🇩🇪%20Germany"); !flagged || iso != "DE" {
+		t.Fatalf("flagged link: %q %v", iso, flagged)
+	}
+	if iso, flagged := isoOfLine("trojan://x@2.2.2.2:443#🇫🇷 France"); !flagged || iso != "FR" {
+		t.Fatalf("french link: %q %v", iso, flagged)
+	}
+	if _, flagged := isoOfLine("vless://a@1.1.1.1:443#plain-name"); !flagged {
+		t.Fatal("plain link must be reported as not flagged")
+	}
+}
+
+func TestLimitLinks(t *testing.T) {
+	res := &RunResult{Links: []string{"a", "b", "c", "d", "e"}}
+	limited := &RunResult{}
+	*limited = *res
+	limited.LimitLinks(3)
+	if len(limited.Links) != 3 {
+		t.Fatalf("limit kept %d links", len(limited.Links))
+	}
+	// order preserved: the kept subset must be an ordered subsequence
+	seen := 0
+	for _, l := range res.Links {
+		if seen < len(limited.Links) && l == limited.Links[seen] {
+			seen++
+		}
+	}
+	if seen != len(limited.Links) {
+		t.Fatalf("order not preserved: %v vs %v", res.Links, limited.Links)
+	}
+	// n >= len keeps everything
+	limited2 := &RunResult{}
+	*limited2 = *res
+	limited2.LimitLinks(10)
+	if len(limited2.Links) != 5 {
+		t.Fatalf("oversize limit lost links: %d", len(limited2.Links))
+	}
+}

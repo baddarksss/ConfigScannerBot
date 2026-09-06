@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -74,6 +75,31 @@ type RunResult struct {
 	Skipped      int
 	CountryCodes []string // unique ISO codes in detection order (for captions)
 	Flags        []string // unique flag emojis in detection order
+	// CountryCounts: ISO -> number of live servers (same order as CountryCodes)
+	CountryCounts map[string]int
+}
+
+// CountsLine renders the per-country live-server counts, e.g. "🇩🇪 آلمان × 4".
+func (r *RunResult) CountsLine(lang string) string {
+	if len(r.CountryCounts) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, iso := range r.CountryCodes {
+		n, ok := r.CountryCounts[iso]
+		if !ok || n == 0 {
+			continue
+		}
+		if i > 0 {
+			sb.WriteString("  ")
+		}
+		name, has := countries.Names(iso, lang)
+		if !has {
+			name = iso
+		}
+		fmt.Fprintf(&sb, "%s %s × %d", Flag(iso), name, n)
+	}
+	return sb.String()
 }
 
 func (r *RunResult) Summary(outLang string) string {
@@ -226,6 +252,7 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 	resultLines := make([]string, total)
 	var okLinks []string
 	var unkLinks []string
+	counts := map[string]int{}
 	doneCount := 0
 
 	for r := range results {
@@ -237,6 +264,7 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 			okLinks = append(okLinks, r.line)
 			if r.code != "" {
 				e.noteCountry(r.code)
+				counts[r.code]++
 			}
 		case kPartial:
 			res.NoCountry++
@@ -269,7 +297,79 @@ func (e *Engine) Run(servers []*ServerSpec, p Progress) *RunResult {
 	}
 	res.CountryCodes = e.codes
 	res.Flags = e.flags
+	res.CountryCounts = counts
 	return res
+}
+
+// FilterLinksByCountries keeps only links whose country is in the set.
+// A nil/empty set keeps everything (unknown-country links included).
+func (r *RunResult) FilterLinksByCountries(keep map[string]bool) {
+	if len(keep) == 0 {
+		return
+	}
+	r.Links = filterCountryLines(r.Links, keep)
+	// unknown-country links survive only when "" is explicitly kept
+	r.UnknownLinks = filterCountryLines(r.UnknownLinks, keep)
+}
+
+// filterCountryLines keeps only lines whose embedded flag emoji maps to a
+// kept country. Lines with no flag survive only when "" is kept.
+func filterCountryLines(lines []string, keep map[string]bool) []string {
+	var out []string
+	for _, l := range lines {
+		if iso, flagged := isoOfLine(l); flagged {
+			if keep[iso] {
+				out = append(out, l)
+			}
+			continue
+		}
+		if keep[""] {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// isoOfLine extracts the ISO code a renamed link was labeled with: the
+// label starts with the flag emoji of that country (🇩🇪 …). Returns
+// ("", true) when the line carries no flag.
+func isoOfLine(line string) (string, bool) {
+	i := strings.IndexFunc(line, func(r rune) bool { return r >= 0x1F1E6 && r <= 0x1F1FF })
+	if i < 0 {
+		return "", true // no flag on this line
+	}
+	runes := []rune(line[i:])
+	if len(runes) < 2 {
+		return "", true
+	}
+	c1, c2 := runes[0], runes[1]
+	if c1 < 0x1F1E6 || c1 > 0x1F1FF || c2 < 0x1F1E6 || c2 > 0x1F1FF {
+		return "", true
+	}
+	return string(rune('A' + c1 - 0x1F1E6)) + string(rune('A' + c2 - 0x1F1E6)), false
+}
+
+// LimitLinks randomly keeps at most n links (order preserved). n<=0 keeps all.
+func (r *RunResult) LimitLinks(n int) {
+	if n <= 0 || n >= len(r.Links) {
+		return
+	}
+	idx := make([]int, len(r.Links))
+	for i := range idx {
+		idx[i] = i
+	}
+	rand.Shuffle(len(idx), func(a, b int) { idx[a], idx[b] = idx[b], idx[a] })
+	sel := make([]bool, len(r.Links))
+	for _, i := range idx[:n] {
+		sel[i] = true
+	}
+	var out []string
+	for i, l := range r.Links {
+		if sel[i] {
+			out = append(out, l)
+		}
+	}
+	r.Links = out
 }
 
 const (

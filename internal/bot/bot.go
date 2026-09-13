@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.1"
+	BotVersion = "1.2.2"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -852,8 +852,9 @@ func (b *Bot) outLimitFlow(chatID int64) {
 		return
 	}
 	total := len(res.Links)
-	_, _ = b.api.sendMessage(chatID, fmt.Sprintf(
-		"🔢 <b>محدودیت تعداد</b>\n\nهم‌اکنون <b>%d</b> لینک سالم داری. عدد دلخواهت را بفرست تا همان‌قدر (تصادفی) نگه داشته شود:", total))
+	_, _ = b.api.sendWithReplyKeyboard(chatID, fmt.Sprintf(
+		"🔢 <b>محدودیت تعداد</b>\n\nهم‌اکنون <b>%d</b> لینک سالم داری. عدد دلخواهت را بفرست تا همان‌قدر (تصادفی) نگه داشته شود:", total),
+		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 	b.mu.Lock()
 	b.setAwaitLocked(chatID, awaitOutLimit, "")
 	b.mu.Unlock()
@@ -1455,12 +1456,25 @@ func (b *Bot) onAdminRemove(c chat, idStr string) {
 		b.replyAdminMenu())
 }
 
+// isBackText reports whether the message is a «back to main menu» press.
+// The section keyboards all use one canonical label, but older chats may
+// still hold variant buttons and users may type the words themselves —
+// match every reasonable variant so back never dead-ends (v1.2.2).
+func isBackText(s string) bool {
+	switch s {
+	case "↩️ بازگشت به منوی اصلی", "↩️ منوی اصلی", "بازگشت به منوی اصلی",
+		"بازگشت به منو", "↩️ بازگشت", "⬅️ بازگشت", "⬅️ منوی اصلی",
+		"بازگشت", "منو", "منوی اصلی", "/menu", "↩️", "⬅️":
+		return true
+	}
+	return false
+}
+
 // routeScanOnly handles (or rejects) input from a scan-only admin: the scan
 // flow plus the log — nothing else, not even via old buttons or commands.
 func (b *Bot) routeScanOnly(c chat, cleanText, lowerText string) {
 	switch {
-	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو" ||
-		cleanText == "↩️ بازگشت به منوی اصلی" || cleanText == "↩️ منوی اصلی":
+	case lowerText == "/start" || lowerText == "/help" || isBackText(cleanText):
 		b.sendMain(c, "")
 	case cleanText == "📡 اسکن کانفیگ" || cleanText == "📡 اسکن" ||
 		cleanText == "📥 ارسال کانفیگ" || lowerText == "/scan":
@@ -1686,21 +1700,12 @@ func (b *Bot) handleUpdate(u update) {
 			return
 		}
 
-		// caption/codes callbacks are not for scan-only admins
-		if !b.isFullAdmin(c.ID) {
-			return
-		}
-		if strings.HasPrefix(data, "setcode:") {
-			iso := strings.TrimPrefix(data, "setcode:")
-			b.setCodePrompt(c, iso)
-			return
-		}
-		if data == "cap:import" {
-			b.importPrompt(c)
-			return
-		}
-
-		// ---- output tools (country filter / limit / file) ----
+		// ---- output tools (country filter / limit / file) + back ----
+		// these run for EVERY admin: scan-only admins get the output-tools
+		// keyboard after each run too, so its buttons — including the
+		// inline «↩️ منوی اصلی» back — must answer for them as well
+		// (v1.2.2 fix: the old full-admin guard ate these callbacks and
+		// left the back button dead for scan-only admins).
 		var cbChat int64
 		if cq.Message != nil && cq.Message.Chat != nil {
 			cbChat = cq.Message.Chat.ID
@@ -1727,6 +1732,17 @@ func (b *Bot) handleUpdate(u update) {
 			b.outCountriesApply(cbChat, true)
 		case data == "menu:back":
 			b.sendMain(chat{ID: cbChat}, "")
+		}
+		// caption/codes callbacks are still full-admin only
+		if strings.HasPrefix(data, "setcode:") || data == "cap:import" {
+			if !b.isFullAdmin(c.ID) {
+				return
+			}
+			if strings.HasPrefix(data, "setcode:") {
+				b.setCodePrompt(c, strings.TrimPrefix(data, "setcode:"))
+			} else {
+				b.importPrompt(c)
+			}
 		}
 		return
 	}
@@ -1766,7 +1782,7 @@ func (b *Bot) handleUpdate(u update) {
 	}
 
 	switch {
-	case lowerText == "/start" || lowerText == "/help" || cleanText == "منو" || cleanText == "↩️ بازگشت به منوی اصلی" || cleanText == "↩️ منوی اصلی":
+	case lowerText == "/start" || lowerText == "/help" || isBackText(cleanText):
 		b.sendMain(c, "")
 		return
 	case cleanText == "📡 اسکن کانفیگ" || cleanText == "📡 اسکن" || cleanText == "📥 ارسال کانفیگ" || lowerText == "/scan":

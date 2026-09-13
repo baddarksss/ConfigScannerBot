@@ -503,3 +503,96 @@ func TestHandleUpdateCodesFileDocument(t *testing.T) {
 		t.Fatalf("codes-file restore broken: DE=%q FR=%q total=%d", de, fr, total)
 	}
 }
+
+// v1.2.2: the back button must work everywhere — every text variant routes
+// back to the main menu, and pressing back clears any pending await state.
+func TestBackTextVariantsAndAwaitClear(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+
+	variants := []string{
+		"↩️ بازگشت به منوی اصلی", "↩️ منوی اصلی", "بازگشت", "↩️ بازگشت",
+		"بازگشت به منو", "منو", "منوی اصلی", "⬅️ بازگشت", "/menu",
+	}
+	for _, v := range variants {
+		if !isBackText(v) {
+			t.Fatalf("isBackText(%q) = false", v)
+		}
+	}
+	if isBackText("شروع اسکن") || isBackText("hello") {
+		t.Fatal("isBackText matched a non-back text")
+	}
+
+	// owner in an await state presses the keyboard back button:
+	// the await must be cleared and the main menu re-sent
+	b.setAwaitLocked(1, awaitCaptionTemplate, "")
+	var u update
+	if err := json.Unmarshal([]byte(`{"update_id":1,"message":{"message_id":1,"chat":{"id":1},"text":"↩️ بازگشت به منوی اصلی"}}`), &u); err != nil {
+		t.Fatal(err)
+	}
+	b.handleUpdate(u)
+	b.mu.Lock()
+	aw := b.awaitKindLocked(1)
+	b.mu.Unlock()
+	if aw != awaitNone {
+		t.Fatalf("back press did not clear await: %v", aw)
+	}
+
+	// the await-consumption path must never swallow the back text either
+	b.setAwaitLocked(1, awaitMessageForUsers, "")
+	var u2 update
+	if err := json.Unmarshal([]byte(`{"update_id":2,"message":{"message_id":2,"chat":{"id":1},"text":"بازگشت"}}`), &u2); err != nil {
+		t.Fatal(err)
+	}
+	b.handleUpdate(u2)
+	b.mu.Lock()
+	aw2 := b.awaitKindLocked(1)
+	saved := b.settings.MessageForUsers
+	b.mu.Unlock()
+	if aw2 != awaitNone {
+		t.Fatalf("variant back press did not clear await: %v", aw2)
+	}
+	if saved == "بازگشت" {
+		t.Fatal("back text was saved as the users message")
+	}
+}
+
+// v1.2.2: scan-only admins get the output-tools keyboard after each run, so
+// its callbacks — including the inline «↩️ منوی اصلی» back — must answer for
+// them too (the old full-admin guard silently ate these callbacks).
+func TestScanOnlyOutputToolsAndBack(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.addOrUpdateAdmin(77, PermScan)
+
+	// stuck in the count-limit await, the scan admin presses inline back:
+	// the await must clear (no silent dead button)
+	b.setAwaitLocked(77, awaitOutLimit, "")
+	var u update
+	if err := json.Unmarshal([]byte(`{"update_id":1,"callback_query":{"id":"cb1","from":{"id":77},"data":"menu:back","message":{"message_id":9,"chat":{"id":77}}}}`), &u); err != nil {
+		t.Fatal(err)
+	}
+	b.handleUpdate(u)
+	b.mu.Lock()
+	aw := b.awaitKindLocked(77)
+	b.mu.Unlock()
+	if aw != awaitNone {
+		t.Fatalf("inline back did not clear scan admin await: %v", aw)
+	}
+
+	// the other output-tools callbacks must reach their handlers as well
+	// (no result yet → they just answer "no scan available", never nothing)
+	for _, data := range []string{"out:countries", "out:limit", "out:file"} {
+		var cb update
+		payload := `{"update_id":2,"callback_query":{"id":"cb2","from":{"id":77},"data":"` + data + `","message":{"message_id":9,"chat":{"id":77}}}}`
+		if err := json.Unmarshal([]byte(payload), &cb); err != nil {
+			t.Fatal(err)
+		}
+		b.handleUpdate(cb) // must not panic / must be handled
+	}
+
+	// caption/codes callbacks stay closed for scan-only admins
+	var cc update
+	if err := json.Unmarshal([]byte(`{"update_id":3,"callback_query":{"id":"cb3","from":{"id":77},"data":"cap:import","message":{"message_id":9,"chat":{"id":77}}}}`), &cc); err != nil {
+		t.Fatal(err)
+	}
+	b.handleUpdate(cc)
+}

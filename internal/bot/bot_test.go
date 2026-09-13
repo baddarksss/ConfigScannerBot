@@ -623,3 +623,42 @@ func TestIsMenuLabel(t *testing.T) {
 		}
 	}
 }
+
+// v1.2.5: after a "start of the range" purge, the offset must resync to the
+// last seen REAL update id — the old offset=0 reset produced offset=1 on the
+// next poll, 409'd again, purged again: an infinite loop where the bot was
+// alive but permanently deaf.
+func TestPurgeResyncAfterRangeError(t *testing.T) {
+	ps := &pollState{}
+	// normal updates flow first
+	ups := []update{{UpdateID: 100}, {UpdateID: 101}}
+	todo, backoff := ps.feed(ups, nil)
+	if backoff != 0 || len(todo) != 2 {
+		t.Fatal("normal feed broken")
+	}
+	if ps.next() != 102 {
+		t.Fatalf("offset after feed = %d", ps.next())
+	}
+	// offset grows stale (bot offline for >24h) -> Telegram 409s
+	_, backoff = ps.feed(nil, errors.New("Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"))
+	if backoff == 0 {
+		t.Fatal("generic error must back off")
+	}
+	var rangeErr error = errors.New("Bad Request: can't get updates with offset 102: start of the range")
+	todo, backoff = ps.feed(nil, rangeErr)
+	if backoff != 0 || todo != nil || !ps.purging {
+		t.Fatal("range error must trigger purge")
+	}
+	// purge poll confirms with an empty reply
+	todo, backoff = ps.feed(nil, nil)
+	if backoff != 0 || todo != nil {
+		t.Fatal("purge confirm must be empty")
+	}
+	if ps.purging {
+		t.Fatal("purge flag must clear")
+	}
+	// THE FIX: resync to the last seen real id, not 0
+	if ps.next() != 102 {
+		t.Fatalf("post-purge offset = %d, want 102 (lastSeen)", ps.next())
+	}
+}

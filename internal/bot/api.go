@@ -203,6 +203,51 @@ func buildKeyboard(rows [][]string) [][]map[string]any {
 	return keyboard
 }
 
+// sendFullKeyboard sends a message carrying BOTH keyboards: the persistent
+// reply keyboard (action buttons) and an inline keyboard (e.g. the back row).
+func (a *tgAPI) sendFullKeyboard(chatID int64, text string, replyRows, inlineRows [][]string) (int, error) {
+	rk := make([][]map[string]any, 0, len(replyRows))
+	for _, row := range replyRows {
+		btns := make([]map[string]any, 0, len(row))
+		for _, t := range row {
+			btns = append(btns, map[string]any{"text": t})
+		}
+		rk = append(rk, btns)
+	}
+	ik := make([][]map[string]any, 0, len(inlineRows))
+	for _, row := range inlineRows {
+		btns := make([]map[string]any, 0, len(row)/2)
+		for i := 0; i+1 < len(row); i += 2 {
+			btns = append(btns, map[string]any{"text": row[i], "callback_data": row[i+1]})
+		}
+		if len(btns) > 0 {
+			ik = append(ik, btns)
+		}
+	}
+	payload := map[string]any{
+		"chat_id":                  chatID,
+		"text":                     text,
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
+		"reply_markup": map[string]any{
+			"keyboard":        rk,
+			"resize_keyboard": true,
+			"is_persistent":   true,
+			"inline_keyboard": ik,
+		},
+	}
+	var out struct {
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	err := a.call("sendMessage", payload, &out)
+	if err != nil {
+		return 0, err
+	}
+	return out.Result.MessageID, nil
+}
+
 func (a *tgAPI) sendWithKeyboard(chatID int64, text string, rows [][]string, method string) (int, error) {
 	payload := menuPayload(chatID, text, rows)
 	var m tgMessage
@@ -312,6 +357,23 @@ func (a *tgAPI) getUpdates(offset int, timeoutSec int) ([]update, error) {
 		"timeout": timeoutSec,
 	}, &out)
 	return out, err
+}
+
+// webhookInfo is the subset of getWebhookInfo we log at startup: a set
+// webhook (or a stale one) silently steals updates from long polling.
+type webhookInfo struct {
+	URL                string `json:"url"`
+	PendingUpdateCount int    `json:"pending_update_count"`
+	LastErrorDate      int64  `json:"last_error_date"`
+	LastErrorMessage   string `json:"last_error_message"`
+}
+
+func (a *tgAPI) getWebhookInfo() (webhookInfo, error) {
+	var out struct {
+		Result webhookInfo `json:"result"`
+	}
+	err := a.call("getWebhookInfo", map[string]any{}, &out)
+	return out.Result, err
 }
 
 func (a *tgAPI) deleteMessage(chatID int64, messageID int) error {

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.4"
+	BotVersion = "1.2.5"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -469,7 +469,7 @@ func (b *Bot) sendMain(c chat, intro string) {
 	b.clearAwaitLocked(c.ID)
 	p := len(b.pending)
 	b.mu.Unlock()
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, intro, b.replyMainMenuFor(c.ID, p))
+	b.sendMenu(c, intro, b.replyMainMenuFor(c.ID, p))
 }
 
 // ------------------------------------------------------------------
@@ -488,7 +488,7 @@ func (b *Bot) onScanRequest(c chat) {
 		msg += fmt.Sprintf("\n\n📥 <b>هم‌اکنون %d کانفیگ در صف آماده است.</b>", p)
 	}
 	// scan section keyboard: only scan buttons until «بازگشت به منوی اصلی»
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyScanMenu())
+	b.sendMenuBack(c, msg, b.replyScanMenu())
 }
 
 func (b *Bot) onConfigInput(c chat, raw string) {
@@ -965,7 +965,7 @@ func (b *Bot) showCaptionMenu(c chat) {
 	b.mu.Lock()
 	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
-	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+	b.sendMenuBack(c,
 		"🏷️ <b>کپشن و پرچم</b>\n\n"+
 			"• <b>قالب کپشن</b>: متنی که زیر پست کانفیگ‌ها قرار می‌گیرد (جای <code>{{FLAGS}}</code> با پرچم‌ها پر می‌شود).\n"+
 			"• <b>کد ایموجی</b>: کدهای عددی پرچم‌های متحرک هر کشور (همان تب Caption اپلیکیشن).\n"+
@@ -1250,7 +1250,7 @@ func (b *Bot) showMsgForUsersMenu(c chat) {
 		msg += "<i>(هنوز متنی ثبت نشده است)</i>"
 	}
 
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMsgForUsersMenu())
+	b.sendMenuBack(c, msg, b.replyMsgForUsersMenu())
 }
 
 func (b *Bot) msgForUsersPrompt(c chat) {
@@ -1294,7 +1294,7 @@ func (b *Bot) showSettingsMenu(c chat) {
 	b.mu.Lock()
 	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
-	_, _ = b.api.sendWithReplyKeyboard(c.ID,
+	b.sendMenuBack(c,
 		"⚙️ <b>تنظیمات ربات</b>\n\n"+
 			"• <b>همزمانی</b>: تعداد سرورهایی که همزمان اسکن می‌شوند.\n"+
 			"• <b>تایم‌اوت</b>: حداکثر زمان انتظار برای پاسخ هر سرور.\n"+
@@ -1378,7 +1378,7 @@ func (b *Bot) onAdminMenu(c chat) {
 		"برای حذف سریع، <code>/rmadmin ID</code> را هم می‌توانید ارسال کنید.\n" +
 		"برای تغییر سطح یا حذف، از دکمه‌های زیر استفاده کنید:")
 	_, _ = b.api.sendWithKeyboard(c.ID, sb.String(), b.adminListKeyboard(), "sendMessage")
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, "👇 برای افزودن ادمین جدید روی «➕ افزودن ادمین» بزنید یا از «↩️ بازگشت» استفاده کنید.", b.replyAdminMenu())
+	b.sendMenuBack(c, "👇 برای افزودن ادمین جدید روی «➕ افزودن ادمین» بزنید یا از «↩️ بازگشت» استفاده کنید.", b.replyAdminMenu())
 }
 
 func (b *Bot) adminAddPrompt(c chat) {
@@ -1526,6 +1526,25 @@ func (b *Bot) sendMenu(c chat, text string, rows [][]string) {
 		_ = b.api.deleteMessage(c.ID, prev)
 	}
 	id, _ := b.api.sendWithReplyKeyboard(c.ID, text, rows)
+	if id > 0 {
+		b.mu.Lock()
+		b.lastMenuMsg[c.ID] = id
+		b.mu.Unlock()
+	}
+}
+
+// sendMenuBack is sendMenu plus an INLINE «↩️ منوی اصلی» row under the
+// message — a second, independent back path: tapping the button on the
+// menu bubble itself works even if the bottom reply keyboard misbehaves.
+func (b *Bot) sendMenuBack(c chat, text string, rows [][]string) {
+	b.mu.Lock()
+	prev := b.lastMenuMsg[c.ID]
+	b.mu.Unlock()
+	if prev != 0 {
+		_ = b.api.deleteMessage(c.ID, prev)
+	}
+	id, _ := b.api.sendFullKeyboard(c.ID, text, rows,
+		[][]string{{"↩️ منوی اصلی", "menu:back"}})
 	if id > 0 {
 		b.mu.Lock()
 		b.lastMenuMsg[c.ID] = id
@@ -1851,6 +1870,12 @@ func (b *Bot) handleUpdate(u update) {
 	cleanText := strings.TrimSpace(text)
 	lowerText := strings.ToLower(cleanText)
 
+	// keyboard-button presses leave their label as a chat bubble — delete
+	// them (best effort) so navigation stays clean (v1.2.4/v1.2.5)
+	if isMenuLabel(cleanText) {
+		b.tidyPress(c)
+	}
+
 	// scan-only admins: only the scan flow. Everything else — settings,
 	// caption, users message, admins — is rejected before any other route.
 	if !b.isFullAdmin(c.ID) {
@@ -2051,11 +2076,18 @@ func (b *Bot) handleUpdate(u update) {
 
 // pollState tracks the getUpdates offset across the polling loop.
 type pollState struct {
-	offset  int
-	purging bool
+	offset   int
+	purging  bool
+	lastSeen int // highest REAL update id the loop has ever been given
 }
 
 func (p *pollState) next() int { return p.offset + 1 }
+
+func (p *pollState) noteSeen(id int) {
+	if id > p.lastSeen {
+		p.lastSeen = id
+	}
+}
 
 // feed handles one getUpdates outcome and returns the updates to process
 // plus a back-off. On Telegram's "start of the range" error the stale range
@@ -2074,12 +2106,18 @@ func (p *pollState) feed(ups []update, err error) (todo []update, backoff time.D
 	if p.purging {
 		p.purging = false
 		if len(ups) == 0 {
-			p.offset = 0
+			// v1.2.5 FIX: resync to the first not-yet-seen REAL update id.
+			// The old offset=0 reset produced offset=1 on the next poll —
+			// far below Telegram's retention window — which 409'd
+			// ("start of the range") again, purged again, reset again: an
+			// infinite loop where the bot was alive but permanently deaf.
+			p.offset = p.lastSeen
 			return nil, 0
 		}
 	}
 	for _, u := range ups {
 		p.offset = u.UpdateID
+		p.noteSeen(u.UpdateID)
 	}
 	return ups, 0
 }
@@ -2090,14 +2128,27 @@ func (b *Bot) Loop() error {
 		return err
 	}
 	fmt.Printf("bot started as @%s, owner=%d (v%s)\n", name, b.ownerID, BotVersion)
+	if wi, err := b.api.getWebhookInfo(); err == nil {
+		fmt.Printf("webhook: url=%q pending=%d lastErr=%q\n",
+			wi.URL, wi.PendingUpdateCount, wi.LastErrorMessage)
+	} else {
+		fmt.Println("webhook: getWebhookInfo failed:", err)
+	}
 	b.startObservers()
 	var ps pollState
 	for {
 		b.notePollStart()
-		ups, err := b.api.getUpdates(ps.next(), 50)
+		t0 := time.Now()
+		ups, err := b.api.getUpdates(ps.next(), 25)
+		dt := time.Since(t0).Round(100 * time.Millisecond)
 		todo, backoff := ps.feed(ups, err)
 		if err != nil {
 			fmt.Println("getUpdates error:", err)
+		} else {
+			// flight recorder: one line per poll — makes a silent/deaf
+			// window instantly diagnosable from the deployment logs
+			fmt.Printf("poll: offset=%d took=%s got=%d\n",
+				ps.next(), dt, len(ups))
 		}
 		if backoff > 0 {
 			time.Sleep(backoff)

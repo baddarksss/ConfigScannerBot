@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.2"
+	BotVersion = "1.2.3"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -115,6 +115,9 @@ type Bot struct {
 	lastResult *engine.RunResult
 	// per-chat pending country selection for the output filter
 	outSel map[int64]map[string]bool
+
+	// liveness counters for the heartbeat / /healthz (see observe.go)
+	rs *runtimeState
 }
 
 // awaitState is what one chat is currently waiting for.
@@ -137,6 +140,7 @@ func NewBot(token string, ownerID int64, dataDir, xrayBin, hyBin string) *Bot {
 		xrayBin: xrayBin,
 		hyBin:   hyBin,
 		awaits:  map[int64]*awaitState{},
+		rs:      &runtimeState{startedAt: time.Now()},
 	}
 	b.load()
 	return b
@@ -2013,8 +2017,10 @@ func (b *Bot) Loop() error {
 		return err
 	}
 	fmt.Printf("bot started as @%s, owner=%d (v%s)\n", name, b.ownerID, BotVersion)
+	b.startObservers()
 	var ps pollState
 	for {
+		b.notePollStart()
 		ups, err := b.api.getUpdates(ps.next(), 50)
 		todo, backoff := ps.feed(ups, err)
 		if err != nil {
@@ -2033,7 +2039,8 @@ func (b *Bot) Loop() error {
 				fmt.Printf("update %d: callback=%q\n",
 					u.UpdateID, clip(u.CallbackQuery.Data, 60))
 			}
-			go b.handleUpdate(u)
+			b.noteUpdate(u.UpdateID)
+			go b.safeHandle(u)
 		}
 	}
 }

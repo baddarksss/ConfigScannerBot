@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.3"
+	BotVersion = "1.2.4"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -118,6 +118,11 @@ type Bot struct {
 
 	// liveness counters for the heartbeat / /healthz (see observe.go)
 	rs *runtimeState
+
+	// chat -> message id of the last MENU bubble we sent; sendMenu deletes
+	// the previous one so the chat keeps a single clean menu trail
+	// (v1.2.4: pressing «بازگشت» used to leave walls of repeated bubbles)
+	lastMenuMsg map[int64]int
 }
 
 // awaitState is what one chat is currently waiting for.
@@ -134,13 +139,14 @@ func NewBot(token string, ownerID int64, dataDir, xrayBin, hyBin string) *Bot {
 		hyBin = "hysteria"
 	}
 	b := &Bot{
-		api:     newAPI(token),
-		ownerID: ownerID,
-		dataDir: dataDir,
-		xrayBin: xrayBin,
-		hyBin:   hyBin,
-		awaits:  map[int64]*awaitState{},
-		rs:      &runtimeState{startedAt: time.Now()},
+		api:         newAPI(token),
+		ownerID:     ownerID,
+		dataDir:     dataDir,
+		xrayBin:     xrayBin,
+		hyBin:       hyBin,
+		awaits:      map[int64]*awaitState{},
+		rs:          &runtimeState{startedAt: time.Now()},
+		lastMenuMsg: map[int64]int{},
 	}
 	b.load()
 	return b
@@ -1224,7 +1230,7 @@ func (b *Bot) onSetCode(c chat, iso, text string) {
 	} else {
 		msg = fmt.Sprintf("✅ کد ایموجی %s %s (%s) با موفقیت ذخیره شد: <code>%s</code>", flag, name, iso, escapeHTML(text))
 	}
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMainMenuFor(c.ID, 0))
+	b.sendMenu(c, msg, b.replyMainMenuFor(c.ID, 0))
 }
 
 // ------------------------------------------------------------------
@@ -1460,6 +1466,73 @@ func (b *Bot) onAdminRemove(c chat, idStr string) {
 		b.replyAdminMenu())
 }
 
+// menuLabels: fixed reply-keyboard button texts. Pressing a reply button
+// sends its label as a regular message; v1.2.4 deletes those press bubbles
+// so navigating the bot no longer buries the chat under repeated texts.
+var menuLabels = map[string]bool{
+	// main / scan
+	"📡 اسکن کانفیگ": true, "📡 اسکن": true, "📥 ارسال کانفیگ": true,
+	"🗑️ پاک کردن لیست": true, "حذف لیست": true, "📊 گزارش / لاگ": true,
+	"شروع اسکن": true, "شروع": true,
+	// settings
+	"⚙️ تنظیمات": true, "📢 تنظیم نام کانال": true,
+	// caption
+	"🏷️ کپشن و پرچم": true, "✏️ ویرایش قالب کپشن": true,
+	"🎨 کدهای ایموجی کشورها": true, "👁️ پیش‌نمایش کپشن": true,
+	"↩️ بازگردانی قالب پیش‌فرض": true, "📥 وارد کردن دسته‌ای کدها": true,
+	"📤 خروجی گرفتن کدها": true,
+	// users message
+	"✏️ پیام برای کاربران": true, "✏️ تنظیم / ویرایش متن": true,
+	"👁️ مشاهده متن فعلی": true, "🗑️ حذف متن پیام": true,
+	// admins + about
+	"👥 ادمین‌ها": true, "📋 لیست ادمین‌ها": true, "➕ افزودن ادمین": true,
+	"ℹ️ راهنما و درباره": true, "ℹ️ درباره": true,
+}
+
+// isMenuLabel reports whether the text is a keyboard-button press (fixed
+// label or one of the stateful labels like «⚙️ …: value» / «▶️ شروع اسکن (N)»).
+func isMenuLabel(s string) bool {
+	if menuLabels[s] || isBackText(s) {
+		return true
+	}
+	for _, p := range []string{
+		"▶️ شروع اسکن", "🔢 همزمانی:", "⏱️ تایم‌اوت:",
+		"🌐 زبان:", "📢 سافیکس:", "🔗 خروجی بدون کشور:",
+	} {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// tidyPress removes the user's button-press bubble (best effort) — the
+// keyboard itself is the interface; echoing the pressed label adds noise.
+func (b *Bot) tidyPress(c chat) {
+	if c.MsgID == 0 {
+		return
+	}
+	_ = b.api.deleteMessage(c.ID, c.MsgID)
+}
+
+// sendMenu sends a menu message and keeps the menu trail short: the previous
+// tracked menu bubble is deleted first, so the chat shows ONE menu at a time
+// (like screens of an app) instead of piling menus up in the history.
+func (b *Bot) sendMenu(c chat, text string, rows [][]string) {
+	b.mu.Lock()
+	prev := b.lastMenuMsg[c.ID]
+	b.mu.Unlock()
+	if prev != 0 {
+		_ = b.api.deleteMessage(c.ID, prev)
+	}
+	id, _ := b.api.sendWithReplyKeyboard(c.ID, text, rows)
+	if id > 0 {
+		b.mu.Lock()
+		b.lastMenuMsg[c.ID] = id
+		b.mu.Unlock()
+	}
+}
+
 // isBackText reports whether the message is a «back to main menu» press.
 // The section keyboards all use one canonical label, but older chats may
 // still hold variant buttons and users may type the words themselves —
@@ -1663,7 +1736,7 @@ func (b *Bot) onAbout(c chat) {
 		"• 🏷️ خروجی تمیز بدون ارقام و شماره‌های اضافی\n" +
 		"• 🎨 کپشن، پیام برای کاربران و سازگاری کامل با اپلیکیشن اندروید\n\n" +
 		"⚙️ تنظیمات فعلی: " + itoaSafe(s.Parallel) + " همزمان · " + itoaSafe(s.TimeoutSec) + " ثانیه · " + langName
-	_, _ = b.api.sendWithReplyKeyboard(c.ID, msg, b.replyMainMenuFor(c.ID, 0))
+	b.sendMenu(c, msg, b.replyMainMenuFor(c.ID, 0))
 }
 
 // ------------------------------------------------------------------

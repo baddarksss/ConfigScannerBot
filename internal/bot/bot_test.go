@@ -596,3 +596,30 @@ func TestScanOnlyOutputToolsAndBack(t *testing.T) {
 	}
 	b.handleUpdate(cc)
 }
+
+// v1.2.4: keyboard presses are recognized as menu labels (their bubbles get
+// tidied), while real content (configs, codes, free text) never matches.
+func TestIsMenuLabel(t *testing.T) {
+	labels := []string{
+		"⚙️ تنظیمات", "🏷️ کپشن و پرچم", "✏️ پیام برای کاربران", "👥 ادمین‌ها",
+		"📊 گزارش / لاگ", "🗑️ پاک کردن لیست", "➕ افزودن ادمین",
+		"👁️ مشاهده متن فعلی", "📥 وارد کردن دسته‌ای کدها",
+		"↩️ بازگشت به منوی اصلی", "بازگشت", "منو",
+		"▶️ شروع اسکن (12 کانفیگ)", "🔢 همزمانی: 4", "⏱️ تایم‌اوت: 8 ثانیه",
+		"🌐 زبان: فارسی", "📢 سافیکس: روشن (@ch)", "🔗 خروجی بدون کشور: خاموش",
+	}
+	for _, l := range labels {
+		if !isMenuLabel(l) {
+			t.Fatalf("isMenuLabel(%q) = false", l)
+		}
+	}
+	content := []string{
+		"vless://u@1.2.3.4:443#x", "DE=123", "سلام", "hello world",
+		"vmess://eyJhZGQiOiIxIn0=", "1234",
+	}
+	for _, c := range content {
+		if isMenuLabel(c) {
+			t.Fatalf("isMenuLabel(%q) = true (content misclassified)", c)
+		}
+	}
+}

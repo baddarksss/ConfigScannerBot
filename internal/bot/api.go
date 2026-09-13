@@ -59,6 +59,9 @@ type update struct {
 type chat struct {
 	ID   int64
 	Name string
+	// message id of the incoming button-press text (0 for callbacks);
+	// recognized menu presses are deleted to keep the chat clean
+	MsgID int
 }
 
 func (u *update) chat() chat {
@@ -67,7 +70,7 @@ func (u *update) chat() chat {
 		if u.Message.From != nil {
 			name = u.Message.From.Name
 		}
-		return chat{ID: u.Message.Chat.ID, Name: name}
+		return chat{ID: u.Message.Chat.ID, Name: name, MsgID: u.Message.MessageID}
 	}
 	if u.CallbackQuery != nil && u.CallbackQuery.Message != nil &&
 		u.CallbackQuery.Message.Chat != nil {

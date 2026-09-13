@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.5"
+	BotVersion = "1.2.6"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -488,7 +488,7 @@ func (b *Bot) onScanRequest(c chat) {
 		msg += fmt.Sprintf("\n\n📥 <b>هم‌اکنون %d کانفیگ در صف آماده است.</b>", p)
 	}
 	// scan section keyboard: only scan buttons until «بازگشت به منوی اصلی»
-	b.sendMenuBack(c, msg, b.replyScanMenu())
+	b.sendMenu(c, msg, b.replyScanMenu())
 }
 
 func (b *Bot) onConfigInput(c chat, raw string) {
@@ -965,7 +965,7 @@ func (b *Bot) showCaptionMenu(c chat) {
 	b.mu.Lock()
 	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
-	b.sendMenuBack(c,
+	b.sendMenu(c,
 		"🏷️ <b>کپشن و پرچم</b>\n\n"+
 			"• <b>قالب کپشن</b>: متنی که زیر پست کانفیگ‌ها قرار می‌گیرد (جای <code>{{FLAGS}}</code> با پرچم‌ها پر می‌شود).\n"+
 			"• <b>کد ایموجی</b>: کدهای عددی پرچم‌های متحرک هر کشور (همان تب Caption اپلیکیشن).\n"+
@@ -1250,7 +1250,7 @@ func (b *Bot) showMsgForUsersMenu(c chat) {
 		msg += "<i>(هنوز متنی ثبت نشده است)</i>"
 	}
 
-	b.sendMenuBack(c, msg, b.replyMsgForUsersMenu())
+	b.sendMenu(c, msg, b.replyMsgForUsersMenu())
 }
 
 func (b *Bot) msgForUsersPrompt(c chat) {
@@ -1294,7 +1294,7 @@ func (b *Bot) showSettingsMenu(c chat) {
 	b.mu.Lock()
 	b.clearAwaitLocked(c.ID)
 	b.mu.Unlock()
-	b.sendMenuBack(c,
+	b.sendMenu(c,
 		"⚙️ <b>تنظیمات ربات</b>\n\n"+
 			"• <b>همزمانی</b>: تعداد سرورهایی که همزمان اسکن می‌شوند.\n"+
 			"• <b>تایم‌اوت</b>: حداکثر زمان انتظار برای پاسخ هر سرور.\n"+
@@ -1378,7 +1378,7 @@ func (b *Bot) onAdminMenu(c chat) {
 		"برای حذف سریع، <code>/rmadmin ID</code> را هم می‌توانید ارسال کنید.\n" +
 		"برای تغییر سطح یا حذف، از دکمه‌های زیر استفاده کنید:")
 	_, _ = b.api.sendWithKeyboard(c.ID, sb.String(), b.adminListKeyboard(), "sendMessage")
-	b.sendMenuBack(c, "👇 برای افزودن ادمین جدید روی «➕ افزودن ادمین» بزنید یا از «↩️ بازگشت» استفاده کنید.", b.replyAdminMenu())
+	b.sendMenu(c, "👇 برای افزودن ادمین جدید روی «➕ افزودن ادمین» بزنید یا از «↩️ بازگشت» استفاده کنید.", b.replyAdminMenu())
 }
 
 func (b *Bot) adminAddPrompt(c chat) {
@@ -1526,25 +1526,6 @@ func (b *Bot) sendMenu(c chat, text string, rows [][]string) {
 		_ = b.api.deleteMessage(c.ID, prev)
 	}
 	id, _ := b.api.sendWithReplyKeyboard(c.ID, text, rows)
-	if id > 0 {
-		b.mu.Lock()
-		b.lastMenuMsg[c.ID] = id
-		b.mu.Unlock()
-	}
-}
-
-// sendMenuBack is sendMenu plus an INLINE «↩️ منوی اصلی» row under the
-// message — a second, independent back path: tapping the button on the
-// menu bubble itself works even if the bottom reply keyboard misbehaves.
-func (b *Bot) sendMenuBack(c chat, text string, rows [][]string) {
-	b.mu.Lock()
-	prev := b.lastMenuMsg[c.ID]
-	b.mu.Unlock()
-	if prev != 0 {
-		_ = b.api.deleteMessage(c.ID, prev)
-	}
-	id, _ := b.api.sendFullKeyboard(c.ID, text, rows,
-		[][]string{{"↩️ منوی اصلی", "menu:back"}})
 	if id > 0 {
 		b.mu.Lock()
 		b.lastMenuMsg[c.ID] = id

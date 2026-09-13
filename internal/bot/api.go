@@ -161,7 +161,6 @@ func (a *tgAPI) sendWithReplyKeyboard(chatID int64, text string, rows [][]string
 		"reply_markup": map[string]any{
 			"keyboard":        keyboard,
 			"resize_keyboard": true,
-			"is_persistent":   true,
 		},
 	}
 	var m tgMessage
@@ -201,51 +200,6 @@ func buildKeyboard(rows [][]string) [][]map[string]any {
 		}
 	}
 	return keyboard
-}
-
-// sendFullKeyboard sends a message carrying BOTH keyboards: the persistent
-// reply keyboard (action buttons) and an inline keyboard (e.g. the back row).
-func (a *tgAPI) sendFullKeyboard(chatID int64, text string, replyRows, inlineRows [][]string) (int, error) {
-	rk := make([][]map[string]any, 0, len(replyRows))
-	for _, row := range replyRows {
-		btns := make([]map[string]any, 0, len(row))
-		for _, t := range row {
-			btns = append(btns, map[string]any{"text": t})
-		}
-		rk = append(rk, btns)
-	}
-	ik := make([][]map[string]any, 0, len(inlineRows))
-	for _, row := range inlineRows {
-		btns := make([]map[string]any, 0, len(row)/2)
-		for i := 0; i+1 < len(row); i += 2 {
-			btns = append(btns, map[string]any{"text": row[i], "callback_data": row[i+1]})
-		}
-		if len(btns) > 0 {
-			ik = append(ik, btns)
-		}
-	}
-	payload := map[string]any{
-		"chat_id":                  chatID,
-		"text":                     text,
-		"parse_mode":               "HTML",
-		"disable_web_page_preview": true,
-		"reply_markup": map[string]any{
-			"keyboard":        rk,
-			"resize_keyboard": true,
-			"is_persistent":   true,
-			"inline_keyboard": ik,
-		},
-	}
-	var out struct {
-		Result struct {
-			MessageID int `json:"message_id"`
-		} `json:"result"`
-	}
-	err := a.call("sendMessage", payload, &out)
-	if err != nil {
-		return 0, err
-	}
-	return out.Result.MessageID, nil
 }
 
 func (a *tgAPI) sendWithKeyboard(chatID int64, text string, rows [][]string, method string) (int, error) {

@@ -77,6 +77,9 @@ type RunResult struct {
 	Flags        []string // unique flag emojis in detection order
 	// CountryCounts: ISO -> number of live servers (same order as CountryCodes)
 	CountryCounts map[string]int
+	// MudfishLink: RAW link after the first {{LINK}} upload (bot-side cache
+	// so one run uploads once, even across caption previews)
+	MudfishLink string
 }
 
 // CountsLine renders the per-country live-server counts, e.g. "🇩🇪 آلمان × 4".

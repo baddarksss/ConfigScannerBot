@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"cfgscanbot/internal/engine"
 )
 
 // Regression (v1.0.7): cycleSetting used to mutate a SETTINGS COPY (from
@@ -660,5 +662,87 @@ func TestPurgeResyncAfterRangeError(t *testing.T) {
 	// THE FIX: resync to the last seen real id, not 0
 	if ps.next() != 102 {
 		t.Fatalf("post-purge offset = %d, want 102 (lastSeen)", ps.next())
+	}
+}
+
+// v1.3.0: the caption supports {{COUNT}} and {{LINK}} app-parity placeholders.
+func TestBuildCaptionCountAndLink(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.mu.Lock()
+	b.settings.CaptionTemplate = "Flags {{FLAGS}}\nCount: {{COUNT}}\nGet: {{LINK}}\nBye"
+	if b.settings.EmojiCodes == nil {
+		b.settings.EmojiCodes = map[string]string{}
+	}
+	b.settings.EmojiCodes["DE"] = "123"
+	b.mu.Unlock()
+	res := &engine.RunResult{Links: []string{"vless://a", "vless://b"}, CountryCodes: []string{"DE"}}
+
+	// stub the uploader
+	orig := mudfishUpload
+	mudfishUpload = func(links []string) (string, error) {
+		if len(links) != 2 {
+			t.Fatal("uploader got wrong link count")
+		}
+		return "https://bin.mudfish.net/r/test-1", nil
+	}
+	defer func() { mudfishUpload = orig }()
+
+	cap := b.buildCaption([]string{"DE"}, res)
+	for _, want := range []string{
+		"Flags [123]", "Count: 2", "Get: https://bin.mudfish.net/r/test-1", "Bye",
+	} {
+		if !strings.Contains(cap, want) {
+			t.Fatalf("caption missing %q:\n%s", want, cap)
+		}
+	}
+	// cached: second render must NOT call the uploader again
+	mudfishUpload = func([]string) (string, error) {
+		t.Fatal("second render re-uploaded")
+		return "", nil
+	}
+	cap2 := b.buildCaption([]string{"DE"}, res)
+	if cap2 != cap {
+		t.Fatal("cached render differs")
+	}
+}
+
+// When the upload fails (or no result), {{LINK}}/{{COUNT}} lines vanish
+// cleanly — no leftover placeholder, no empty line.
+func TestBuildCaptionPlaceholdersUnavailable(t *testing.T) {
+	b := NewBot("token", 1, t.TempDir(), "xray", "hysteria")
+	b.mu.Lock()
+	b.settings.CaptionTemplate = "Top {{FLAGS}}\n{{COUNT}}\n{{LINK}}\nEnd"
+	if b.settings.EmojiCodes == nil {
+		b.settings.EmojiCodes = map[string]string{}
+	}
+	b.settings.EmojiCodes["DE"] = "9"
+	b.mu.Unlock()
+
+	// no result at all
+	cap := b.buildCaption([]string{"DE"}, nil)
+	if strings.Contains(cap, "{{COUNT}}") || strings.Contains(cap, "{{LINK}}") {
+		t.Fatalf("placeholders leaked:\n%s", cap)
+	}
+	if strings.Contains(cap, "Count:") || strings.Contains(cap, "Get:") {
+		t.Fatalf("empty placeholder lines survived:\n%s", cap)
+	}
+	if !strings.Contains(cap, "Top [9]") || !strings.Contains(cap, "End") {
+		t.Fatalf("rest of caption damaged:\n%s", cap)
+	}
+	if strings.Count(cap, "\n") != 1 {
+		t.Fatalf("placeholder-only lines left empty rows:\n%q", cap)
+	}
+
+	// upload error behaves the same
+	orig := mudfishUpload
+	mudfishUpload = func([]string) (string, error) { return "", errors.New("net down") }
+	defer func() { mudfishUpload = orig }()
+	res := &engine.RunResult{Links: []string{"vless://a"}, CountryCodes: []string{"DE"}}
+	cap2 := b.buildCaption([]string{"DE"}, res)
+	if strings.Contains(cap2, "{{LINK}}") || strings.Contains(cap2, "Get:") {
+		t.Fatalf("failed-upload line survived:\n%s", cap2)
+	}
+	if !strings.Contains(cap2, "1") {
+		t.Fatalf("count lost though available:\n%s", cap2)
 	}
 }

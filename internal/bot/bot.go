@@ -6,6 +6,7 @@ import (
 	"html"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +16,7 @@ import (
 )
 
 const (
-	BotVersion = "1.2.6"
+	BotVersion = "1.3.0"
 	// DefaultCaptionTemplate mirrors the app's caption template.
 	DefaultCaptionTemplate = "NpvTunnel [6050626661043411760]  \n[5395616385734833119] لوکیشن | Location {{FLAGS}}\n\n[617260195842813119] @Wpnfa  \n\n[5206607083980820]  \n#npvtunnel #vpn #v2ray\n#فیلترشکن #vpn #پروکسی"
 	// tgTextLimit is Telegram's 4096 message cap minus a safety margin.
@@ -681,7 +682,7 @@ func (b *Bot) startRun(c chat) {
 
 	// 4) Caption — Sent ALONE without header text so copying copies ONLY the caption
 	if len(res.CountryCodes) > 0 && cfg.CaptionTemplate != "" {
-		caption := b.buildCaption(res.CountryCodes)
+		caption := b.buildCaption(res.CountryCodes, res)
 		if caption != "" {
 			_, _ = b.api.sendMessage(chatID, escapeHTML(caption))
 		}
@@ -967,7 +968,7 @@ func (b *Bot) showCaptionMenu(c chat) {
 	b.mu.Unlock()
 	b.sendMenu(c,
 		"🏷️ <b>کپشن و پرچم</b>\n\n"+
-			"• <b>قالب کپشن</b>: متنی که زیر پست کانفیگ‌ها قرار می‌گیرد (جای <code>{{FLAGS}}</code> با پرچم‌ها پر می‌شود).\n"+
+			"• <b>قالب کپشن</b>: متنی که زیر پست کانفیگ‌ها قرار می‌گیرد — <code>{{FLAGS}}</code> پرچم‌ها، <code>{{COUNT}}</code> تعداد لینک‌های سالم و <code>{{LINK}}</code> لینک Raw مادفیش (مثل اپ).\n"+
 			"• <b>کد ایموجی</b>: کدهای عددی پرچم‌های متحرک هر کشور (همان تب Caption اپلیکیشن).\n"+
 			"• <b>پیش‌نمایش</b>: مشاهده کپشن نهایی با کشورهای اسکن قبلی.\n\n"+
 			"یکی از گزینه‌های زیر را انتخاب کنید:",
@@ -982,7 +983,7 @@ func (b *Bot) captionEditPrompt(c chat) {
 	_, _ = b.api.sendWithReplyKeyboard(c.ID,
 		"✏️ <b>ویرایش قالب کپشن</b>\n\n"+
 			"قالب فعلی:\n<pre>"+escapeHTML(s.CaptionTemplate)+"</pre>\n\n"+
-			"متن قالب جدید را بفرستید (باید شامل <code>{{FLAGS}}</code> باشد).\n"+
+			"متن قالب جدید را بفرستید (باید شامل <code>{{FLAGS}}</code> باشد؛ <code>{{COUNT}}</code> و <code>{{LINK}}</code> اختیاری‌اند).\n"+
 			"برای لغو، «↩️ بازگشت به منوی اصلی» را بزنید.",
 		[][]string{{"↩️ بازگشت به منوی اصلی"}})
 }
@@ -1007,7 +1008,10 @@ func (b *Bot) captionPreview(c chat) {
 		_, _ = b.api.sendMessage(c.ID, "ابتدا یک اسکن انجام دهید تا کشورهای فعال مشخص شوند.")
 		return
 	}
-	caption := b.buildCaption(codes)
+	b.mu.Lock()
+	lastRes := b.lastResult
+	b.mu.Unlock()
+	caption := b.buildCaption(codes, lastRes)
 	if caption == "" {
 		_, _ = b.api.sendMessage(c.ID, "کپشنی ساخته نشد.")
 		return
@@ -1019,7 +1023,14 @@ func (b *Bot) captionPreview(c chat) {
 	_ = b.api.sendDocument(c.ID, []byte(caption), "caption_preview.txt", "👁️ پیش‌نمایش کپشن")
 }
 
-func (b *Bot) buildCaption(codes []string) string {
+// mudfishUpload is an indirection so tests can stub the network call.
+var mudfishUpload = engine.MudfishUpload
+
+// buildCaption renders the caption template app-parity style (v1.3.0):
+// {{FLAGS}} = emoji flag row, {{COUNT}} = healthy-link count,
+// {{LINK}} = Mudfish RAW link of the healthy links (uploaded on demand).
+// A line holding ONLY an unavailable placeholder disappears cleanly.
+func (b *Bot) buildCaption(codes []string, res *engine.RunResult) string {
 	b.mu.Lock()
 	s := b.settingsLocked()
 	b.mu.Unlock()
@@ -1032,10 +1043,55 @@ func (b *Bot) buildCaption(codes []string) string {
 		}
 	}
 	flagsLine := sb.String()
-	if strings.Contains(s.CaptionTemplate, "{{FLAGS}}") {
-		return strings.ReplaceAll(s.CaptionTemplate, "{{FLAGS}}", flagsLine)
+	out := s.CaptionTemplate
+	if strings.Contains(out, "{{FLAGS}}") {
+		out = strings.ReplaceAll(out, "{{FLAGS}}", flagsLine)
+	} else {
+		out = out + "\n" + flagsLine
 	}
-	return s.CaptionTemplate + "\n" + flagsLine
+	if strings.Contains(out, "{{COUNT}}") {
+		count := ""
+		if res != nil && len(res.Links) > 0 {
+			count = strconv.Itoa(len(res.Links))
+		}
+		out = dropOrReplace(out, "{{COUNT}}", count)
+	}
+	if strings.Contains(out, "{{LINK}}") {
+		link := ""
+		if res != nil && len(res.Links) > 0 {
+			if res.MudfishLink != "" {
+				link = res.MudfishLink
+			} else if url, err := mudfishUpload(res.Links); err == nil {
+				link = url
+				b.mu.Lock()
+				res.MudfishLink = url // cache: one upload per run
+				b.mu.Unlock()
+			} else {
+				fmt.Println("mudfish upload failed:", err)
+			}
+		}
+		out = dropOrReplace(out, "{{LINK}}", link)
+	}
+	return out
+}
+
+// dropOrReplace replaces a placeholder, or — when it has no value — removes
+// the placeholder and any line that held only it (no empty lines behind).
+func dropOrReplace(text, ph, val string) string {
+	if !strings.Contains(text, ph) {
+		return text
+	}
+	if val != "" {
+		return strings.ReplaceAll(text, ph, val)
+	}
+	var kept []string
+	for _, ln := range strings.Split(text, "\n") {
+		if strings.TrimSpace(ln) == ph {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	return strings.ReplaceAll(strings.Join(kept, "\n"), ph, "")
 }
 
 func (b *Bot) onCodesMenu(c chat) {

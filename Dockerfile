@@ -11,9 +11,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# pin the xray core version (same line the app updates to)
-ARG XRAY_VERSION=26.7.28
+# pin the Xray version bundled by the app; verify the upstream release asset
+ARG XRAY_VERSION=26.10.17
+ARG XRAY_SHA256=ecdd54eccd24c4c21a8f00968e7dbf7f5996da92383d2321170b560dc4a95158
 RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip \
+    && echo "${XRAY_SHA256}  /tmp/xray.zip" | sha256sum -c - \
     && unzip -qo /tmp/xray.zip -d /tmp/xray \
     && install /tmp/xray/xray /usr/local/bin/xray \
     && rm -rf /tmp/xray /tmp/xray.zip \
